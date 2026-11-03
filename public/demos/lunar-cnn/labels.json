@@ -1,0 +1,22 @@
+{
+  "title": "LunarLander · CNN from pixels",
+  "description": "A small CNN that flies from pixels only: the last two 64x64 grayscale frames, deciding every 4 physics ticks (12.5 Hz). Taught by imitating the PPO expert (behaviour cloning + DAgger); every action in this episode is the CNN's own choice.",
+  "inputs": [
+    "frame t-1",
+    "frame t"
+  ],
+  "outputs": [
+    "nothing",
+    "left engine",
+    "main engine",
+    "right engine"
+  ],
+  "icons": [
+    "icons/noop.svg",
+    "icons/left.svg",
+    "icons/main.svg",
+    "icons/right.svg"
+  ],
+  "output_mode": "categorical",
+  "input_units": null
+}

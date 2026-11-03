@@ -1,0 +1,13 @@
+# Exact versions used to build the bundled demos (Python 3.12.3).
+# torch is the CPU wheel:  uv pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
+# Install torch first, otherwise stable-baselines3 pulls the large CUDA build.
+torch==2.15.0
+numpy==2.5.4
+gymnasium[box2d]==1.4.0
+box2d==2.3.10
+pygame-ce==2.5.8
+swig==4.5.1
+stable-baselines3==2.9.2
+onnx==1.23.2
+onnxruntime==1.31.1
+pillow==13.0.0

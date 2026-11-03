@@ -1,0 +1,37 @@
+{
+  "title": "LunarLander · PPO MLP",
+  "description": "A PPO agent (Stable-Baselines3, 2x64 tanh MLP) landing from the 8-number state: position, velocity, tilt, spin and leg contacts. Outputs are logits for its 4 discrete actions.",
+  "inputs": [
+    "x",
+    "y",
+    "x speed",
+    "y speed",
+    "angle",
+    "spin",
+    "left leg",
+    "right leg"
+  ],
+  "outputs": [
+    "nothing",
+    "left engine",
+    "main engine",
+    "right engine"
+  ],
+  "icons": [
+    "icons/noop.svg",
+    "icons/left.svg",
+    "icons/main.svg",
+    "icons/right.svg"
+  ],
+  "output_mode": "categorical",
+  "input_units": [
+    "",
+    "",
+    "",
+    "",
+    "rad",
+    "",
+    "0/1",
+    "0/1"
+  ]
+}

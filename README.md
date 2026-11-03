@@ -71,8 +71,8 @@ Plain arrays only: object / pickled arrays are refused.
 ```json
 {
   "title": "LunarLander · PPO MLP",
-  "inputs": ["x", "y", "vx", "vy", "angle", "ang. vel", "left leg", "right leg"],
-  "outputs": ["idle", "left engine", "main engine", "right engine"],
+  "inputs": ["x", "y", "x speed", "y speed", "angle", "spin", "left leg", "right leg"],
+  "outputs": ["nothing", "left engine", "main engine", "right engine"],
   "icons": ["icons/noop.svg", "icons/left.svg", "icons/main.svg", "icons/right.svg"],
   "output_mode": "categorical",
   "input_units": ["", "", "", "", "rad", "", "0/1", "0/1"]

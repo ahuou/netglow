@@ -29,7 +29,7 @@ interface LabelsFile {
 
 const DEMOS = [
   { id: "lunar-mlp", title: "LunarLander, MLP", sub: "PPO policy reading 8 numbers" },
-  { id: "lunar-cnn", title: "LunarLander, CNN", sub: "the same pilot, flying from pixels" },
+  { id: "lunar-cnn", title: "LunarLander, CNN", sub: "a CNN pilot that flies from pixels" },
 ];
 
 const S = {

@@ -8,3 +8,6 @@ python/**/__pycache__/
 test-results/
 *.log
 .preview.log
+docs/exports/
+test/exports/
+test/shots/
