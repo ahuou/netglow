@@ -5,7 +5,7 @@ Drop in a neural network and a recording of its inputs, and get an animated "glo
 video never leave your machine.
 
 **Try it: [ahuou.github.io/netglow](https://ahuou.github.io/netglow/)** (demos: [MLP](https://ahuou.github.io/netglow/?demo=lunar-mlp),
-[CNN](https://ahuou.github.io/netglow/?demo=lunar-cnn), [pixels + numbers](https://ahuou.github.io/netglow/?demo=lunar-mixed), [residual MLP](https://ahuou.github.io/netglow/?demo=lunar-resmlp), [LSTM](https://ahuou.github.io/netglow/?demo=lunar-lstm)).
+[CNN](https://ahuou.github.io/netglow/?demo=lunar-cnn), [pixels + numbers](https://ahuou.github.io/netglow/?demo=lunar-mixed), [residual MLP](https://ahuou.github.io/netglow/?demo=lunar-resmlp), [LSTM](https://ahuou.github.io/netglow/?demo=lunar-lstm), [compare](https://ahuou.github.io/netglow/?demo=lunar-compare)).
 
 ![netglow showing a LunarLander PPO policy](docs/screenshot.png)
 
@@ -104,6 +104,22 @@ video never leave your machine.
 - Demo **LunarLander, LSTM** (`?demo=lunar-lstm`): sees only x, y, tilt and leg contacts, no speeds and no spin,
   so it has to remember how it was moving. Taught to imitate the PPO expert (behaviour cloning + DAgger on whole
   episodes); it landed 38 of 50 fresh seeds (76 %, mean return 207). The recording holds two landings.
+
+### Compare two models
+
+![netglow comparing a trained and an early PPO checkpoint on the same landing](docs/compare.png)
+
+- Files → **Compare → Second model**: any `.onnx` that reads the same recording (same architecture or not) runs on
+  it next to the first one. Both are drawn on one canvas and play on one timeline.
+- **Side by side** splits the chosen size in two; **Stacked** gives each model a full panel of the chosen size (the
+  canvas and the export are then about twice as tall). **Auto** stacks on narrow screens and for square or
+  portrait sizes. The recording's render is drawn once, in panel A.
+- A strip under the panels marks every tick where the two choose differently (red), with a playhead; the timeline
+  gets the same row. "Values" outputs show how close the two output vectors are instead. The strip and both panels
+  are in every export.
+- Demo **LunarLander, early vs trained** (`?demo=lunar-compare`): the MLP demo's landing run through its PPO policy
+  at 1M steps (landed 49 of 50 fresh seeds, mean return 266) and the same training run at 60k steps (landed 7 of 50,
+  mean return −68). They choose the same action on 24 % of the ticks.
 
 ## 30-second quickstart
 
@@ -270,6 +286,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | `src/settings.ts` | the settings object: defaults, merge, localStorage, JSON and share-link hash |
 | `src/saliency.ts` | the reverse pass for the saliency heatmap (gradient × input) |
 | `src/image.ts` | turning an image input tensor back into pixels (range, gray / RGB, frame stack) |
+| `src/compare.ts` | compare mode: two Renderers in panels, the agreement strip |
 | `src/export.ts` | GIF (gifenc) and WebCodecs video (mediabunny) |
 | `src/io/npy.ts` | `.npy` / `.npz` (zip + DecompressionStream) / JSON readers |
 | `python/` | demo training and `export_recording.py` |
@@ -287,6 +304,7 @@ the extra demos from `test/fixtures/demos_v2.py`):
 node test/smoke.mjs mlp        # also: cnn, rgbf, mixed, resmlp, rescnn, gated (expects a clear rejection), demo:lunar-mlp
 node test/recurrent.mjs        # LSTM / GRU: state threaded and reset, loop edges exact, cell recomputation, demo
 node test/saliency.mjs         # heatmap vs finite differences, overlay, opacity, in the export
+node test/compare.mjs          # compare: demo, agreement strip, side by side / stacked, phone, exports with both
 node test/residual.mjs         # skips: exact split at the Add, arcs over the block, no overlaps, rejection of gating
 node test/mixed.mjs            # two-input demo: match, lanes, edges from both branches, drag, short GIF
 node test/panel.mjs            # extreme sizes: no picture, label, title or column overlaps another

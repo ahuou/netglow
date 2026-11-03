@@ -62,6 +62,26 @@
           <h2>Demos</h2>
           <div class="demo-list" id="demoList"></div>
         </section>
+        <section id="compareSection">
+          <h2>Compare</h2>
+          <div class="file-row" data-kind="compare">
+            <label class="file-btn">
+              <input type="file" accept=".onnx" id="fileCompare" />
+              <span class="file-kind">Second model</span>
+              <span class="file-name" id="nameCompare">.onnx, run on the same recording</span>
+            </label>
+          </div>
+          <div class="field compare-on" hidden>
+            <label for="cmpLayout">Layout</label>
+            <select id="cmpLayout">
+              <option value="auto">Auto (stacked on narrow screens)</option>
+              <option value="side">Side by side</option>
+              <option value="stacked">Stacked</option>
+            </select>
+          </div>
+          <p class="hint" id="cmpNote" aria-live="polite"></p>
+          <button class="btn small compare-on" id="cmpOff" type="button" hidden>Stop comparing</button>
+        </section>
         <section id="labelsSection" hidden>
           <h2>Inputs</h2>
           <ul class="label-list" id="inputLabels"></ul>

@@ -1,0 +1,42 @@
+{
+  "title": "LunarLander · trained vs early PPO",
+  "description": "The same recording (the trained PPO policy landing) run through two checkpoints of that policy: A = trained for 1M steps (landed 98% of 50 fresh seeds, mean return 266), B = the same run after 60k steps (landed 14%, mean return -68). They pick the same action on 24% of the ticks.",
+  "inputs": [
+    "x",
+    "y",
+    "x speed",
+    "y speed",
+    "angle",
+    "spin",
+    "left leg",
+    "right leg"
+  ],
+  "outputs": [
+    "nothing",
+    "left engine",
+    "main engine",
+    "right engine"
+  ],
+  "icons": [
+    "icons/noop.svg",
+    "icons/left.svg",
+    "icons/main.svg",
+    "icons/right.svg"
+  ],
+  "output_mode": "categorical",
+  "input_units": [
+    "",
+    "",
+    "",
+    "",
+    "rad",
+    "",
+    "0/1",
+    "0/1"
+  ],
+  "compare": {
+    "model": "model-b.onnx",
+    "a": "trained, 1M steps",
+    "b": "early, 60k steps"
+  }
+}

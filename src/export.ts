@@ -11,6 +11,8 @@ import type { Viz } from "./compute";
 export type ExportFormat = "gif" | "webm" | "webm-alpha" | "mp4";
 
 export interface ExportJob {
+  /** builds what draws a frame (compare mode: both panels); default: one Renderer */
+  make?: (opt: RenderOpts) => { draw(ctx: CanvasRenderingContext2D, tRec: number, dt: number): void; width?: number; height?: number };
   viz: Viz;
   labels: Labels;
   opt: RenderOpts; // width/height/fps/speed/transparent are the export's
@@ -31,10 +33,14 @@ export interface ExportResult {
 export async function runExport(job: ExportJob): Promise<ExportResult> {
   const { opt } = job;
   const canvas = document.createElement("canvas");
-  canvas.width = opt.width;
-  canvas.height = opt.height;
   const transparent = job.format === "webm-alpha" || (job.format === "gif" && opt.transparent);
-  const r = new Renderer(job.viz, job.labels, { ...opt, transparent });
+  const make = job.make ?? ((o: RenderOpts) => new Renderer(job.viz, job.labels, o));
+  const r: NonNullable<ExportJob["make"]> extends (o: RenderOpts) => infer D ? D : never = make({ ...opt, transparent });
+  // a stacked comparison is taller than the chosen size
+  const W = r.width ?? opt.width;
+  const H = r.height ?? opt.height;
+  canvas.width = W;
+  canvas.height = H;
   const ctx = canvas.getContext("2d", { alpha: true, willReadFrequently: job.format === "gif" })!;
   const duration = (job.tEnd - job.tStart) / opt.speed;
   const n = Math.max(1, Math.round(duration * opt.fps));
@@ -45,11 +51,11 @@ export async function runExport(job: ExportJob): Promise<ExportResult> {
   if (job.format === "gif") {
     // palette from ~12 frames spread over the clip
     const samples: Uint8ClampedArray[] = [];
-    const probe = new Renderer(job.viz, job.labels, { ...opt, transparent });
+    const probe = make({ ...opt, transparent });
     for (let q = 0; q < 12; q++) {
       const i = Math.floor((q / 12) * n);
       probe.draw(ctx, job.tStart + (i / opt.fps) * opt.speed, 0);
-      samples.push(ctx.getImageData(0, 0, opt.width, opt.height).data);
+      samples.push(ctx.getImageData(0, 0, W, H).data);
     }
     const all = new Uint8ClampedArray(samples.reduce((a, s) => a + s.length, 0));
     let off = 0;
@@ -65,9 +71,9 @@ export async function runExport(job: ExportJob): Promise<ExportResult> {
     for (let i = 0; i < n; i++) {
       if (job.signal.aborted) throw new DOMException("Export cancelled", "AbortError");
       frameAt(i);
-      const data = ctx.getImageData(0, 0, opt.width, opt.height).data;
+      const data = ctx.getImageData(0, 0, W, H).data;
       const index = applyPalette(data, palette, format);
-      gif.writeFrame(index, opt.width, opt.height, { palette: i === 0 ? palette : undefined, delay, transparent: tIndex >= 0, transparentIndex: Math.max(0, tIndex), repeat: 0 });
+      gif.writeFrame(index, W, H, { palette: i === 0 ? palette : undefined, delay, transparent: tIndex >= 0, transparentIndex: Math.max(0, tIndex), repeat: 0 });
       if (i % 4 === 0) {
         job.onProgress(i / n, `frame ${i + 1} of ${n}`);
         await yieldUI();
@@ -79,7 +85,7 @@ export async function runExport(job: ExportJob): Promise<ExportResult> {
 
   const mp4 = job.format === "mp4";
   const candidates: VideoCodec[] = mp4 ? ["avc", "vp9", "av1"] : ["vp9", "vp8", "av1"];
-  const codec = await getFirstEncodableVideoCodec(candidates, { width: opt.width, height: opt.height });
+  const codec = await getFirstEncodableVideoCodec(candidates, { width: W, height: H });
   if (!codec) throw new Error(`This browser cannot encode ${mp4 ? "MP4" : "WebM"} video with WebCodecs. Try GIF, or Chrome / Edge.`);
   const output = new Output({ format: mp4 ? new Mp4OutputFormat({ fastStart: "in-memory" }) : new WebMOutputFormat(), target: new BufferTarget() });
   const src = new CanvasSource(canvas, { codec, bitrate: QUALITY_HIGH, alpha: transparent ? "keep" : "discard" });

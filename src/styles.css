@@ -320,7 +320,7 @@ select { cursor: pointer; }
   body { overflow: auto; }
   .workspace { grid-template-columns: 1fr; height: auto; }
   .stage { order: -1; grid-template-rows: auto auto; }
-  .well { aspect-ratio: 16 / 9; }
+  .well { aspect-ratio: var(--canvas-ratio, 16 / 9); }
   .panel { overflow: visible; }
   .local-note { display: none; }
 }
