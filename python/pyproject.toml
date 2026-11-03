@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "netglow"
+version = "0.1.0"
+description = "Export a PyTorch / Stable-Baselines3 policy and its inputs for netglow, the in-browser glowing-network viewer; or stream them live."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "alex huou" }]
+# torch is not a hard dependency: pip would pull the large CUDA build. Install the wheel you want first.
+dependencies = [
+  "numpy>=1.24",
+  "onnx>=1.15",
+  "websockets>=13",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.1"]
+verify = ["onnxruntime>=1.17"]
+sb3 = ["stable-baselines3>=2.0", "gymnasium>=0.29"]
+test = ["pytest>=8", "onnxruntime>=1.17", "stable-baselines3>=2.0", "gymnasium[box2d]>=0.29"]
+
+[project.scripts]
+netglow = "netglow.cli:main"
+
+[project.urls]
+Homepage = "https://ahuou.github.io/netglow/"
+Source = "https://github.com/ahuou/netglow"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/netglow"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/netglow", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

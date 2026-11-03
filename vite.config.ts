@@ -5,5 +5,6 @@ import { defineConfig } from "vite";
 export default defineConfig({
   base: process.env.NETGLOW_BASE ?? "./",
   build: { target: "es2022", chunkSizeWarningLimit: 2000 },
+  server: { watch: { ignored: ["**/python/**"] } }, // keep the watcher off venvs
   optimizeDeps: { exclude: ["onnxruntime-web"] },
 });
