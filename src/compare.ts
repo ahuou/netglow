@@ -130,6 +130,9 @@ export class CompareRenderer {
       ctx.beginPath();
       ctx.rect(0, 0, w, h);
       ctx.clip();
+      // one common scale: each panel may shrink no less than the other (A also reserves the recording's column)
+      const other = i === 0 ? this.b : this.a;
+      r.opt.fitCap = other.natFit;
       r.draw(ctx, tRec, dt);
       ctx.restore();
       // panel name, above the panel

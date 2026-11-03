@@ -96,6 +96,8 @@ export interface RenderOpts {
   transparent: boolean;
   topK: number;
   showFrame: boolean;
+  /** largest fit shrink allowed (compare mode passes the other panel's, so both draw at one scale) */
+  fitCap?: number;
   frames: NdArray | null;
   obs: NdArray;
   /** decision rate of the recording in Hz */
@@ -223,6 +225,8 @@ export class Renderer {
   boxes: Box[] = [];
   /** uniform shrink applied because the content did not fit the width at full size (1 = none) */
   fit = 1;
+  /** the shrink this panel would pick on its own, before any fitCap */
+  natFit = 1;
   /** per edge set (index into viz.edges): the y where its skip arcs peak */
   skipPeak = new Map<number, number>();
   /** per recurrent column: how far its loops may bulge to the right */
@@ -257,6 +261,9 @@ export class Renderer {
       if (need <= this.opt.width + 0.5 || f <= 0.3) break;
       f = Math.max(0.3, f * Math.min(0.97, this.opt.width / need));
     }
+    this.natFit = f;
+    const cap = this.opt.fitCap ?? 1;
+    if (cap < f) this.place(ctx, cap);
     return this.u;
   }
 
