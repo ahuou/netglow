@@ -17,7 +17,7 @@ if (which.startsWith("demo:")) {
 await page.waitForFunction(() => window.netglow?.S?.viz || document.querySelector("#status.error"), null, { timeout: 60000 });
 const st = await page.evaluate(() => ({ status: document.querySelector("#status").textContent, match: document.querySelector("#matchKv").innerText, pill: document.querySelector("#matchPill").textContent }));
 console.log(JSON.stringify(st, null, 1));
-await page.evaluate(() => { const n = window.netglow; n.S.t = (n.S.viz.T * 0.4) / n.S.hz; n.redraw(0); });
+await page.evaluate(() => { const n = window.netglow; if (n.S.viz) { n.S.t = (n.S.viz.T * 0.4) / n.S.hz; n.redraw(0); } });
 await page.waitForTimeout(300);
 const name = which.replace(":", "-");
 await page.screenshot({ path: `test/shots/${name}.png` });

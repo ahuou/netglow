@@ -28,3 +28,18 @@ class Res(nn.Module):
     def forward(s, x): return s.b(torch.relu(s.a(x)) + x)
 torch.onnx.export(Res(), torch.zeros(1, 8), f"{out}/residual.onnx", input_names=["obs"], output_names=["logits"], dynamic_axes={"obs": {0: "batch"}}, opset_version=17, dynamo=False)
 np.savez_compressed(f"{out}/residual.npz", obs=obs)
+
+# RGB float input, mean/std normalised (values outside -1..1): exercises RGB layout + "stretch" display
+class RGBNet(nn.Module):
+    def __init__(s):
+        super().__init__()
+        s.c = nn.Sequential(nn.Conv2d(3, 8, 5, 2, padding=2), nn.ReLU(), nn.MaxPool2d(2), nn.Conv2d(8, 16, 3, 1, padding=1), nn.ReLU(), nn.Flatten())
+        s.h = nn.Sequential(nn.Linear(16 * 8 * 8, 32), nn.ReLU(), nn.Linear(32, 3))
+    def forward(s, x): return s.h(s.c(x))
+rgb = RGBNet()
+yy, xx = np.mgrid[0:32, 0:32]
+imgs = np.stack([np.stack([np.sin(xx / 4 + t / 5), np.cos(yy / 5 - t / 7), np.sin((xx + yy) / 6 + t / 3)]) for t in range(60)]).astype(np.float32)
+imgs = (imgs * 0.5 + 0.5 - 0.45) / 0.22
+with torch.no_grad(): lg3 = rgb(torch.from_numpy(imgs)).numpy()
+torch.onnx.export(rgb, torch.zeros(1, 3, 32, 32), f"{out}/rgbf.onnx", input_names=["obs"], output_names=["logits"], dynamic_axes={"obs": {0: "batch"}, "logits": {0: "batch"}}, opset_version=17, dynamo=False)
+np.savez_compressed(f"{out}/rgbf.npz", obs=imgs, actions=lg3.argmax(1).astype(np.int64), outputs=lg3, fps=np.float64(10))

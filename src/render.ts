@@ -7,9 +7,15 @@
 //   output  - one node per output with its icon; glow = probability, the chosen (argmax) one is ringed and lit
 //   edges   - per target node, the top-k sources by |contribution| this tick; warm = excites, cool = inhibits
 //   pulse   - a faint band sweeping left to right once per decision tick
+// Image models: the input column is one image node (the current frame, pixels kept visible, border lit by how
+// much the frame changed), optionally a large "What the AI sees" view above or beside the network, and conv
+// channels can be drawn as their live feature maps instead of dots.
 
 import type { Viz } from "./compute";
 import type { NdArray } from "./io/npy";
+import { frameRGBA, type ImageView } from "./image";
+
+export type AiView = "off" | "above" | "beside";
 
 export interface Theme {
   id: string;
@@ -54,6 +60,19 @@ export interface RenderOpts {
   speed: number;
   /** output fps, so the pulse never strobes faster than the frames can show */
   fps: number;
+  /** image models: how to display the input tensor (null for vector inputs) */
+  image: ImageView | null;
+  aiView: AiView;
+  showMaps: boolean;
+}
+
+interface Pic {
+  kind: "rec" | "ai";
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  caption: string;
 }
 
 type RGB = [number, number, number];
@@ -72,28 +91,21 @@ export class Renderer {
   private thumb = document.createElement("canvas");
   private frameCanvas = document.createElement("canvas");
   private tinted = new Map<string, HTMLCanvasElement>();
-  private obsRange: [number, number] = [0, 1];
-  // layout, recomputed in draw
+  private mapCanvas = document.createElement("canvas");
+    // layout, recomputed in draw
   X: number[] = [];
   Y: number[][] = [];
   r = 10;
-  frameRect: [number, number, number, number] | null = null;
+  /** per column: half-width of a node, where edges attach */
+  half: number[] = [];
+  mapSize = 0;
+  pics: Pic[] = [];
+  /** image node thumbnail [x, y, w, h] */
+  imgRect: [number, number, number, number] | null = null;
+  private headerY = 40;
+  private textX = 28;
 
-  constructor(public viz: Viz, public labels: Labels, public opt: RenderOpts) {
-    if (viz.imageInput) {
-      const d = opt.obs.data;
-      if (opt.obs.dtype === "u1") this.obsRange = [0, 255];
-      else {
-        let lo = Infinity, hi = -Infinity;
-        for (let i = 0; i < d.length; i += 7) {
-          const v = Number(d[i]);
-          lo = Math.min(lo, v);
-          hi = Math.max(hi, v);
-        }
-        this.obsRange = [lo, hi > lo ? hi : lo + 1];
-      }
-    }
-  }
+  constructor(public viz: Viz, public labels: Labels, public opt: RenderOpts) {}
 
   resetEase() {
     this.ease = null;
@@ -104,32 +116,76 @@ export class Renderer {
     const { width: W, height: H } = this.opt;
     const s = H / 720;
     const cols = this.viz.cols;
+    const o = this.opt;
+    // pictures: the recording's render and / or what the AI sees
+    const want: { kind: Pic["kind"]; w0: number; h0: number; caption: string }[] = [];
+    if (o.showFrame && o.frames) want.push({ kind: "rec", w0: o.frames.shape[2], h0: o.frames.shape[1], caption: "Recording" });
+    if (o.aiView !== "off" && o.image) want.push({ kind: "ai", w0: o.image.W, h0: o.image.H, caption: `What the AI sees (${o.image.W}×${o.image.H})` });
+    const above = o.aiView === "above" && !!o.image;
+    const cap = 30 * s;
+    const m = 28 * s;
     let left = 0;
-    this.frameRect = null;
-    const fr = this.opt.frames;
-    if (this.opt.showFrame && fr) {
-      const [fh, fw] = [fr.shape[1], fr.shape[2]];
+    let topBand = 0;
+    this.pics = [];
+    if (want.length && above) {
+      const bandH = H * 0.42;
+      const gap = 40 * s;
+      let h = bandH - cap - 14 * s;
+      let ws = want.map((p) => (h * p.w0) / p.h0);
+      const total = ws.reduce((a, b) => a + b, 0) + gap * (want.length - 1);
+      const k = Math.min(1, (W - 2 * m) / total);
+      h *= k;
+      ws = ws.map((w) => w * k);
+      let x = (W - (ws.reduce((a, b) => a + b, 0) + gap * (want.length - 1))) / 2;
+      want.forEach((p, i) => {
+        this.pics.push({ kind: p.kind, x, y: 14 * s + cap, w: ws[i], h, caption: p.caption });
+        x += ws[i] + gap;
+      });
+      topBand = 14 * s + cap + h;
+    } else if (want.length) {
       const maxW = W * 0.3;
-      let h = Math.min(H - 80 * s, H * 0.62);
-      let w = (h * fw) / fh;
-      if (w > maxW) {
-        w = maxW;
-        h = (w * fh) / fw;
-      }
-      this.frameRect = [28 * s, (H - h) / 2, w, h];
-      left = w + 40 * s;
+      const gap = 20 * s;
+      const each = Math.min((H - 2 * m - want.length * cap - gap * (want.length - 1)) / want.length, H * 0.62);
+      const sizes = want.map((p) => {
+        let h = each;
+        let w = (h * p.w0) / p.h0;
+        if (w > maxW) {
+          w = maxW;
+          h = (w * p.h0) / p.w0;
+        }
+        return [w, h];
+      });
+      let y = (H - sizes.reduce((a, [, h]) => a + h + cap, 0) - gap * (want.length - 1)) / 2;
+      want.forEach((p, i) => {
+        const [w, h] = sizes[i];
+        this.pics.push({ kind: p.kind, x: m, y: y + cap, w, h, caption: p.caption });
+        y += cap + h + gap;
+      });
+      left = m + Math.max(...sizes.map(([w]) => w)) + 12 * s;
     }
-    const labelW = (this.viz.imageInput ? 170 : 200) * s;
+    this.headerY = topBand + 40 * s;
+    const top = topBand + 86 * s;
+    const bot = H - 40 * s;
+    // image node size (image models): the frame at a size where its pixels are visible
+    let labelW = 200 * s;
+    this.imgRect = null;
+    if (this.viz.imageInput && o.image) {
+      const th = Math.min(124 * s, (bot - top) * 0.5);
+      const tw = Math.min(160 * s, (th * o.image.W) / o.image.H);
+      labelW = tw + 96 * s;
+      this.imgRect = [0, 0, tw, (tw * o.image.H) / o.image.W];
+    }
     const outW = 224 * s;
-    const x0 = left + labelW;
+    this.textX = left + (left ? 0 : m);
+    const x0 = this.textX + labelW;
     const x1 = W - outW;
     const nc = cols.length;
     this.X = cols.map((_, i) => x0 + ((x1 - x0) * i) / Math.max(1, nc - 1));
-    const top = 86 * s;
-    const bot = H - 40 * s;
     const maxN = Math.max(...cols.map((c) => c.sel.length));
     const pitch = Math.min(46 * s, (bot - top) / Math.max(1, maxN - 1));
     this.r = Math.max(3, Math.min(11 * s, pitch * 0.3));
+    this.mapSize = Math.max(6, Math.min(pitch * 0.78, 38 * s));
+    this.half = cols.map((c, ci) => (ci === 0 && this.imgRect ? 2 * s : o.showMaps && c.maps ? this.mapSize / 2 : this.r));
     this.Y = cols.map((c) => {
       const n = c.sel.length;
       const p = c.kind === "hidden" ? pitch : Math.min(pitch * 1.25, (bot - top) / Math.max(1, n - 1), 56 * s);
@@ -139,6 +195,10 @@ export class Renderer {
       c.order.forEach((ii, slot) => (ys[ii] = y0 + slot * p));
       return ys;
     });
+    if (this.imgRect) {
+      const [, , tw, th] = this.imgRect;
+      this.imgRect = [this.X[0] - tw, this.Y[0][0] - th / 2, tw, th];
+    }
     return s;
   }
 
@@ -178,14 +238,14 @@ export class Renderer {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillStyle = th.dim;
-    viz.cols.forEach((c, ci) => ctx.fillText(c.label, this.X[ci] + (c.kind === "output" ? 40 * s : 0), 40 * s));
+    viz.cols.forEach((c, ci) => ctx.fillText(c.label, this.X[ci] + (c.kind === "output" ? 40 * s : ci === 0 && this.imgRect ? -this.imgRect[2] / 2 : 0), this.headerY));
 
     // pulse: sweep once per decision tick, or once per m ticks when ticks come faster than ~4 frames
     const ticksPerSec = o.hz * o.speed;
     const m = Math.max(1, Math.ceil((ticksPerSec * 4) / o.fps));
     const ph = (tickF / m) % 1;
     const nc = viz.cols.length;
-    for (let ci = 0; ci < nc; ci++) {
+    for (let ci = this.imgRect ? 1 : 0; ci < nc; ci++) {
       const g = Math.exp(-((ph * (nc + 1) - ci - 0.5) ** 2) / 0.35);
       if (g < 0.05) continue;
       const x = this.X[ci];
@@ -204,8 +264,8 @@ export class Renderer {
       const to = viz.cols[e.to];
       const nf = from.sel.length;
       const nt = to.sel.length;
-      const xs = this.X[e.from] + this.r;
-      const xd = this.X[e.to] - this.r;
+      const xs = this.X[e.from] + this.half[e.from];
+      const xd = this.X[e.to] - this.half[e.to];
       const kk = Math.min(o.topK, nf);
       const base = k * nt * nf;
       for (let j = 0; j < nt; j++) {
@@ -228,41 +288,31 @@ export class Renderer {
       }
     }
 
-    // frame (context render from the recording)
-    if (this.frameRect && o.frames) {
-      const [fx, fy, fw, fh] = this.frameRect;
-      const f = o.frames;
-      const [, h, w] = f.shape;
-      this.frameCanvas.width = w;
-      this.frameCanvas.height = h;
-      const fc = this.frameCanvas.getContext("2d")!;
-      const img = fc.createImageData(w, h);
-      const src = f.data as Uint8Array;
-      const off = k * h * w * 3;
-      for (let p = 0, q = 0; p < h * w; p++, q += 4) {
-        img.data[q] = src[off + p * 3];
-        img.data[q + 1] = src[off + p * 3 + 1];
-        img.data[q + 2] = src[off + p * 3 + 2];
-        img.data[q + 3] = 255;
-      }
-      fc.putImageData(img, 0, 0);
-      ctx.imageSmoothingEnabled = true;
-      ctx.drawImage(this.frameCanvas, fx, fy, fw, fh);
+    // pictures: recording render and what the AI sees, each with a caption
+    for (const p of this.pics) {
+      ctx.font = `500 ${15 * s}px "Public Sans", system-ui, sans-serif`;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.fillStyle = th.dim;
+      ctx.fillText(p.caption, p.x, p.y - 10 * s);
+      if (p.kind === "rec") this.blitRecording(ctx, k, p.x, p.y, p.w, p.h);
+      else this.blitInput(ctx, k, 0, p.x, p.y, p.w, p.h);
     }
+    ctx.textBaseline = "middle";
 
     // input column
     const inCol = viz.cols[0];
     const xIn = this.X[0];
-    const labX = (this.frameRect ? this.frameRect[0] + this.frameRect[2] + 20 * s : 28 * s);
+    const labX = this.textX;
     ctx.textBaseline = "middle";
-    inCol.sel.forEach((unit, ii) => {
+    if (this.imgRect) this.drawImageNode(ctx, k, E[0][0], C, s);
+    else inCol.sel.forEach((unit, ii) => {
       const y = this.Y[0][ii];
       ctx.textAlign = "left";
       ctx.fillStyle = th.text;
       ctx.font = `600 ${17 * s}px "Public Sans", system-ui, sans-serif`;
       ctx.fillText(this.labels.inputs[unit] ?? `in ${unit}`, labX, y);
-      if (viz.imageInput) this.drawChannel(ctx, k, unit, xIn - this.r - 12 * s, y, s);
-      else {
+      {
         const raw = inCol.raw![k * inCol.sel.length + ii];
         ctx.textAlign = "right";
         ctx.fillStyle = th.dim;
@@ -274,7 +324,11 @@ export class Renderer {
     });
 
     // hidden columns
-    for (let ci = 1; ci < nc - 1; ci++) viz.cols[ci].sel.forEach((_, ii) => this.node(ctx, this.X[ci], this.Y[ci][ii], E[ci][ii], C, s, false, 0));
+    for (let ci = 1; ci < nc - 1; ci++) {
+      const col = viz.cols[ci];
+      const maps = o.showMaps ? col.maps : undefined;
+      col.sel.forEach((_, ii) => (maps ? this.mapNode(ctx, k, col, ii, this.X[ci], this.Y[ci][ii], E[ci][ii], C, s) : this.node(ctx, this.X[ci], this.Y[ci][ii], E[ci][ii], C, s, false, 0)));
+    }
 
     // outputs
     const outCol = viz.cols[nc - 1];
@@ -343,26 +397,103 @@ export class Renderer {
     }
   }
 
-  private drawChannel(ctx: CanvasRenderingContext2D, k: number, c: number, xr: number, y: number, s: number) {
-    const im = this.viz.imageInput!;
-    const { H, W, C } = im;
-    this.thumb.width = W;
-    this.thumb.height = H;
+  /** nearest-neighbour blit of input frame `age` (0 = newest) */
+  private blitInput(ctx: CanvasRenderingContext2D, k: number, age: number, x: number, y: number, w: number, h: number) {
+    const iv = this.opt.image!;
+    if (this.thumb.width !== iv.W || this.thumb.height !== iv.H) {
+      this.thumb.width = iv.W;
+      this.thumb.height = iv.H;
+    }
     const tc = this.thumb.getContext("2d")!;
-    const img = tc.createImageData(W, H);
-    const d = this.opt.obs.data;
-    const [lo, hi] = this.obsRange;
-    const off = (k * C + c) * H * W;
+    const img = tc.createImageData(iv.W, iv.H);
+    frameRGBA(this.opt.obs, iv, k, age, img.data);
+    tc.putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(this.thumb, x, y, w, h);
+    ctx.imageSmoothingEnabled = true;
+  }
+
+  private blitRecording(ctx: CanvasRenderingContext2D, k: number, x: number, y: number, w: number, h: number) {
+    const f = this.opt.frames!;
+    const [, fh, fw] = f.shape;
+    this.frameCanvas.width = fw;
+    this.frameCanvas.height = fh;
+    const fc = this.frameCanvas.getContext("2d")!;
+    const img = fc.createImageData(fw, fh);
+    const src = f.data as Uint8Array;
+    const off = k * fh * fw * 3;
+    for (let p = 0, q = 0; p < fh * fw; p++, q += 4) {
+      img.data[q] = src[off + p * 3];
+      img.data[q + 1] = src[off + p * 3 + 1];
+      img.data[q + 2] = src[off + p * 3 + 2];
+      img.data[q + 3] = 255;
+    }
+    fc.putImageData(img, 0, 0);
+    ctx.drawImage(this.frameCanvas, x, y, w, h);
+  }
+
+  /** the input column of an image model: current frame, border lit by how much it changed, older stack frames below */
+  private drawImageNode(ctx: CanvasRenderingContext2D, k: number, v: number, C: Record<string, RGB>, s: number) {
+    const [x, y, w, h] = this.imgRect!;
+    const iv = this.opt.image!;
+    const b = 3 * s;
+    if (v > 0.3) {
+      ctx.fillStyle = rgba(C.on, 0.25 * (v - 0.3) / 0.7);
+      roundRect(ctx, x - b - 6 * s, y - b - 6 * s, w + 2 * b + 12 * s, h + 2 * b + 12 * s, 8 * s);
+      ctx.fill();
+    }
+    ctx.fillStyle = mix(C.off, C.on, Math.min(1, v) ** 0.7);
+    ctx.fillRect(x - b, y - b, w + 2 * b, h + 2 * b);
+    this.blitInput(ctx, k, 0, x, y, w, h);
+    ctx.textAlign = "right";
+    ctx.fillStyle = this.opt.theme.text;
+    ctx.font = `600 ${17 * s}px "Public Sans", system-ui, sans-serif`;
+    ctx.fillText(this.labels.inputs[0] ?? "image", x - b - 14 * s, y + h / 2);
+    // older frames of the stack, newest first, small and dimmer
+    const older = Math.min(iv.frames - 1, 3);
+    if (older > 0) {
+      const sw = Math.min(w / 3 - 4 * s, 44 * s);
+      const sh = (sw * iv.H) / iv.W;
+      ctx.font = `400 ${12 * s}px "Public Sans", system-ui, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillStyle = this.opt.theme.dim;
+      for (let a = 1; a <= older; a++) {
+        const sx = x + w - a * (sw + 6 * s) + 6 * s;
+        const sy = y + h + b + 10 * s;
+        ctx.globalAlpha = 0.75;
+        this.blitInput(ctx, k, a, sx, sy, sw, sh);
+        ctx.globalAlpha = 1;
+        ctx.fillText(`t−${a}`, sx + sw / 2, sy + sh + 10 * s);
+      }
+    }
+  }
+
+  /** a conv channel drawn as its live activation map; outline lit by the channel's mean activation */
+  private mapNode(ctx: CanvasRenderingContext2D, k: number, col: Viz["cols"][number], ii: number, x: number, y: number, v: number, C: Record<string, RGB>, s: number) {
+    const { H, W, data } = col.maps!;
+    const q = this.mapSize;
+    const ns = col.sel.length;
+    if (this.mapCanvas.width !== W || this.mapCanvas.height !== H) {
+      this.mapCanvas.width = W;
+      this.mapCanvas.height = H;
+    }
+    const mc = this.mapCanvas.getContext("2d")!;
+    const img = mc.createImageData(W, H);
+    const off = (k * ns + ii) * H * W;
     for (let p = 0; p < H * W; p++) {
-      const v = Math.max(0, Math.min(255, ((Number(d[off + p]) - lo) / (hi - lo)) * 255));
-      img.data[p * 4] = img.data[p * 4 + 1] = img.data[p * 4 + 2] = v;
+      const t = (data[off + p] / 255) ** 0.8;
+      img.data[p * 4] = C.off[0] + (C.on[0] - C.off[0]) * t;
+      img.data[p * 4 + 1] = C.off[1] + (C.on[1] - C.off[1]) * t;
+      img.data[p * 4 + 2] = C.off[2] + (C.on[2] - C.off[2]) * t;
       img.data[p * 4 + 3] = 255;
     }
-    tc.putImageData(img, 0, 0);
-    const h = Math.min(64 * s, (this.Y[0].length > 1 ? Math.abs(this.Y[0][1] - this.Y[0][0]) : 80 * s) - 8 * s);
-    const w = (h * W) / H;
+    mc.putImageData(img, 0, 0);
+    const b = Math.max(1.5, 2 * s);
+    ctx.fillStyle = mix(C.off, C.on, Math.min(1, v) ** 0.7);
+    roundRect(ctx, x - q / 2 - b, y - q / 2 - b, q + 2 * b, q + 2 * b, 3 * s);
+    ctx.fill();
     ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(this.thumb, xr - w, y - h / 2, w, h);
+    ctx.drawImage(this.mapCanvas, x - q / 2, y - q / 2, q, q);
     ctx.imageSmoothingEnabled = true;
   }
 

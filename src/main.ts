@@ -14,6 +14,8 @@ import { buildViz, orderHidden, type OutputMode, type Viz } from "./compute";
 import { parseJsonRecording, parseNpy, parseNpz, toFloat, type NdArray } from "./io/npy";
 import { Renderer, THEMES, type Labels, type Theme } from "./render";
 import { runExport, type ExportFormat } from "./export";
+import { imageView, type ImageSettings, type ImageView } from "./image";
+import type { AiView } from "./render";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -58,6 +60,10 @@ const S = {
   topK: 3,
   nodes: 10,
   showFrame: false,
+  aiView: "above" as AiView,
+  showMaps: true,
+  img: { range: "auto", layout: "auto", newest: "last" } as ImageSettings,
+  imageView: null as ImageView | null,
   transparent: false,
   exportAbort: null as AbortController | null,
   lastUrl: "",
@@ -263,7 +269,9 @@ function resolveLabels(): Labels {
   const nOut = viz.cols[viz.cols.length - 1].n;
   const recIn = rec.get("input_names")?.strings;
   const recOut = rec.get("output_names")?.strings;
-  const inputs = Array.from({ length: nIn }, (_, i) => S.nameOverride.inputs.get(i) ?? lf.inputs?.[i] ?? recIn?.[i] ?? (viz.imageInput ? `channel ${i}` : `in ${i}`));
+  const inputs = viz.imageInput
+    ? [S.nameOverride.inputs.get(0) ?? "image"]
+    : Array.from({ length: nIn }, (_, i) => S.nameOverride.inputs.get(i) ?? lf.inputs?.[i] ?? recIn?.[i] ?? `in ${i}`);
   const outputs = Array.from({ length: nOut }, (_, i) => S.nameOverride.outputs.get(i) ?? lf.outputs?.[i] ?? recOut?.[i] ?? `out ${i}`);
   const icons = outputs.map((name, i) => {
     const o = S.iconOverride.get(i);
@@ -294,6 +302,9 @@ function renderOpts() {
     transparent: S.transparent,
     topK: S.topK,
     showFrame: S.showFrame,
+    image: S.imageView,
+    aiView: S.aiView,
+    showMaps: S.showMaps,
     frames: S.rec?.get("frames") ?? null,
     obs: S.obs!,
     hz: S.hz,
@@ -304,6 +315,10 @@ function renderOpts() {
 
 function makeRenderer() {
   if (!S.viz || !S.labels) return;
+  S.imageView = S.viz.imageInput && S.obs ? imageView(S.obs, S.img) : null;
+  $("imageDescribe").textContent = S.imageView ? `Reading the input as ${S.imageView.describe}.` : "";
+  document.querySelectorAll<HTMLElement>(".image-only").forEach((el) => (el.hidden = !S.imageView));
+  document.querySelectorAll<HTMLElement>(".maps-only").forEach((el) => (el.hidden = !S.viz!.cols.some((c) => c.maps)));
   const o = renderOpts();
   view.width = o.width;
   view.height = o.height;
@@ -625,6 +640,22 @@ $("hz").addEventListener("change", (e) => {
     makeRenderer();
     redraw(0);
   }
+});
+for (const [id, key] of [["pxRange", "range"], ["pxLayout", "layout"], ["pxNewest", "newest"]] as const)
+  $(id).addEventListener("change", (e) => {
+    (S.img as unknown as Record<string, string>)[key] = (e.target as HTMLSelectElement).value;
+    makeRenderer();
+    redraw(0);
+  });
+$("aiView").addEventListener("change", (e) => {
+  S.aiView = (e.target as HTMLSelectElement).value as AiView;
+  if (S.renderer) S.renderer.opt.aiView = S.aiView;
+  redraw(0);
+});
+$("showMaps").addEventListener("change", (e) => {
+  S.showMaps = (e.target as HTMLInputElement).checked;
+  if (S.renderer) S.renderer.opt.showMaps = S.showMaps;
+  redraw(0);
 });
 $("showFrame").addEventListener("change", (e) => {
   S.showFrame = (e.target as HTMLInputElement).checked;

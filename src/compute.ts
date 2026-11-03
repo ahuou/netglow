@@ -32,6 +32,9 @@ export interface VizColumn {
   v: Float32Array;
   /** input column: raw values per tick (T x sel.length) for the live readout; output: probability or value */
   raw?: Float32Array;
+  /** conv columns: real activation maps of the selected channels, per tick, each channel scaled 0..255
+   *  over the whole recording (1st..99th percentile). Layout: T x sel.length x H x W */
+  maps?: { H: number; W: number; data: Uint8Array };
 }
 
 export interface VizEdges {
@@ -241,7 +244,9 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
     const { c, G } = contributions(L[k], srcOf(k), T, targets, cache);
     const score = new Float64Array(G);
     for (let t = 0; t < T; t++) for (let jj = 0; jj < targets.length; jj++) for (let g = 0; g < G; g++) score[g] += Math.abs(c[(t * targets.length + jj) * G + g]);
-    const cap = k === 0 ? (G <= opt.maxInputs ? G : opt.nodesPerColumn) : opt.nodesPerColumn;
+    const isImageSrc = k === 0 && obsDims.length === 3;
+    // an image input is one node: every channel of the stack is kept, then summed into one edge per target
+    const cap = isImageSrc ? G : k === 0 ? (G <= opt.maxInputs ? G : opt.nodesPerColumn) : opt.nodesPerColumn;
     let sel = topIdx(score, cap);
     if (k === 0) sel = sel.sort((a, b) => a - b);
     sels[k] = sel;
@@ -257,6 +262,20 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
           r[(t * nt + jj) * ns + ii] = v;
           ma[jj * ns + ii] += Math.abs(v) / T;
         }
+    if (isImageSrc) {
+      const r1 = new Float32Array(T * nt);
+      const m1 = new Float64Array(nt);
+      for (let q = 0; q < T * nt; q++) {
+        let sum = 0;
+        for (let ii = 0; ii < ns; ii++) sum += r[q * ns + ii];
+        r1[q] = sum;
+        m1[q % nt] += Math.abs(sum) / T;
+      }
+      sels[0] = [0];
+      edgeRaw[k] = { c: r1, G, from: k };
+      meanAbs[k] = m1;
+      continue;
+    }
     edgeRaw[k] = { c: r, G, from: k };
     meanAbs[k] = ma;
   }
@@ -264,10 +283,21 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
   // columns
   const cols: VizColumn[] = [];
   // input column: brightness = how fast each input changes, scaled per input over the recording
-  {
+  if (obsDims.length === 3) {
+    // image node: brightness = how much the whole input image changed since the last tick
+    const size = obsDims[0] * obsDims[1] * obsDims[2];
+    const chg = new Float32Array(T);
+    for (let t = 1; t < T; t++) {
+      let d = 0;
+      for (let p = 0; p < size; p++) d += Math.abs(obsF[t * size + p] - obsF[(t - 1) * size + p]);
+      chg[t] = d / size;
+    }
+    const sc = Math.max(percentile(chg, 95), 1e-9);
+    cols.push({ kind: "input", label: "input", n: 1, sel: [0], order: [0], v: chg.map((x) => Math.min(1, x / sc)) });
+  } else {
     const sel = sels[0];
     const ns = sel.length;
-    const isImg = obsDims.length === 3;
+    const isImg = false;
     const C = isImg ? obsDims[0] : obsDims.reduce((a, b) => a * b, 1);
     const per = isImg ? obsDims[1] * obsDims[2] : 1;
     const size = C * per;
@@ -305,7 +335,8 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
     const lo = percentile(vals, 5);
     const hi = percentile(vals, 95);
     const v = vals.map((x) => Math.min(1, Math.max(0, (x - lo) / Math.max(hi - lo, 1e-9))));
-    cols.push({ kind: "hidden", label: `${L[k].label} · ${u.n}`, n: u.n, sel, order: [...Array(ns).keys()], v });
+    const act = get(L[k].actTensor);
+    cols.push({ kind: "hidden", label: `${L[k].label} · ${u.n}`, n: u.n, sel, order: [...Array(ns).keys()], v, maps: act.dims.length === 3 ? featureMaps(act, sel, T) : undefined });
   }
   {
     const ns = outSel.length;
@@ -328,6 +359,24 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
   (viz as VizInternal)._meanAbs = meanAbs;
   orderHidden(viz);
   return viz;
+}
+
+/** selected channels' activation maps as bytes, each channel scaled by its own 1st..99th percentile */
+function featureMaps(act: { dims: number[]; size: number; data: Float32Array }, sel: number[], T: number) {
+  const [, H, W] = act.dims;
+  const hw = H * W;
+  const ns = sel.length;
+  const out = new Uint8Array(T * ns * hw);
+  for (let ii = 0; ii < ns; ii++) {
+    const c = sel[ii];
+    const vals = new Float32Array(T * hw);
+    for (let t = 0; t < T; t++) vals.set(act.data.subarray(t * act.size + c * hw, t * act.size + (c + 1) * hw), t * hw);
+    const lo = percentile(vals, 1);
+    const hi = Math.max(percentile(vals, 99), lo + 1e-9);
+    for (let t = 0; t < T; t++)
+      for (let p = 0; p < hw; p++) out[(t * ns + ii) * hw + p] = Math.max(0, Math.min(255, ((vals[t * hw + p] - lo) / (hi - lo)) * 255));
+  }
+  return { H, W, data: out };
 }
 
 interface VizInternal extends Viz {

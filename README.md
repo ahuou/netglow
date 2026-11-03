@@ -15,6 +15,27 @@ video never leave your machine.
   logged, so you know the picture shows the network that actually flew the episode.
 - **Export** GIF, MP4, WebM, or WebM with alpha to composite over your own footage.
 
+### Image models
+
+![netglow showing a CNN pilot that flies LunarLander from pixels](docs/screenshot-cnn.png)
+
+- The input column is one **image node**: the current tick's frame, nearest-neighbour upscaled so the
+  pixels stay visible, its border lit by how much the frame changed since the last tick. Older frames of a
+  stack sit under it (`t−1`, `t−2`, ...). Its edges into the first conv column are the per-channel
+  contributions summed over the stack.
+- **What the AI sees (W×H)**: a large view of the model's actual input, above the network or beside it
+  (View → "What the AI sees"). With "Recording on canvas" on, the recording's own render sits next to it.
+  Both are drawn on the canvas, so they are in every export, alpha included (the pictures are opaque, the
+  rest stays transparent).
+- **Feature maps on conv channels** (toggle): each shown conv channel is drawn as its live activation map
+  (the real tensor, after the layer's nonlinearity / pooling), scaled per channel by its 1st to 99th
+  percentile over the whole recording. The outline is lit by the channel's mean, as for a plain node.
+- **Pixel values** are detected and undone for display: uint8 is shown as 0 to 255; floats in 0..1 or -1..1
+  are mapped accordingly; anything else (mean/std normalised) is stretched per channel to its 1st..99th
+  percentile. **Channels**: a channel count divisible by 3 is read as RGB frames, otherwise grayscale
+  frames. **Newest frame**: last channels by default (first for stacks stored newest first). All three can
+  be overridden in the View panel, which also says what was detected.
+
 ## 30-second quickstart
 
 ```bash
@@ -94,7 +115,8 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | Dense ← dense edges | **exact** `W[j,i] · a[i]`: contribution of unit *i* to the pre-activation of unit *j* (bias excluded) |
 | Dense ← conv edges (after `Flatten`) | **exact** per channel: `Σ_pixels W[j, c, p] · a[c, p]` |
 | Conv ← conv edges | **exact for the channel mean**: contribution of input channel *c* to the spatial mean of output channel *d*'s pre-activation, `Σ_taps W[d,c,k] · mean(a[c] at the pixels tap k reads)` |
-| Conv node brightness | **summary**: spatial mean of the channel; spatial structure is not shown |
+| Conv node brightness | **summary**: spatial mean of the channel; the feature-map toggle shows the full map |
+| Image node edges | **exact**, summed: the per-channel conv contributions of every channel in the stack, added up |
 | Through nonlinearities | **local**: contributions are into pre-activations; a ReLU that is off still draws its incoming edges. This is the linear part of the story, not a gradient through the whole network |
 | Node selection | heuristic: units with the largest mean |contribution| into the shown units of the next column, from the outputs backwards |
 | Node brightness curve | displayed as `v^0.7` of the normalised value (monotonic, lifts mid values) |
@@ -104,6 +126,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 
 - Chain-shaped graphs only (MLP, CNN encoder + MLP head). No residuals, multi-input, RNN / attention.
 - One input tensor. Mixed image + vector observations need a single concatenated input for now.
+- Image inputs must be channels-first `[N, C, H, W]`; a channels-last model (leading `Transpose`) is rejected.
 - Grouped / depthwise convolutions are rejected; `Transpose` between conv and dense is warned about.
 - The whole trace is held in memory: fine for small policies and recordings of a few thousand ticks.
 - WebM / MP4 need WebCodecs (Chrome, Edge, recent Safari / Firefox). GIF works everywhere. WebM with alpha
@@ -119,7 +142,8 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | `src/analyze.ts` | finding the chain of weighted layers and which tensors to fetch |
 | `src/run.ts` | onnxruntime-web session, batched run over the recording |
 | `src/compute.ts` | contributions, node selection, normalisation, match check |
-| `src/render.ts` | drawing one frame on a canvas, themes, hit-testing for drag |
+| `src/render.ts` | drawing one frame on a canvas, themes, image node, feature maps, hit-testing for drag |
+| `src/image.ts` | turning an image input tensor back into pixels (range, gray / RGB, frame stack) |
 | `src/export.ts` | GIF (gifenc) and WebCodecs video (mediabunny) |
 | `src/io/npy.ts` | `.npy` / `.npz` (zip + DecompressionStream) / JSON readers |
 | `python/` | demo training and `export_recording.py` |
@@ -127,3 +151,14 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 ## License
 
 MIT
+
+## Tests
+
+With `npm run dev -- --port 5181` running (fixtures come from `test/make_fixtures.py`):
+
+```bash
+node test/smoke.mjs mlp        # also: cnn, rgbf, residual (expects a clear rejection), demo:lunar-mlp
+node test/image.mjs            # image node, AI view, feature maps, pixel-range detection
+node test/drag.mjs             # drag and keyboard reorder
+node test/export.mjs mlp gif out.gif
+```
