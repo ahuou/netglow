@@ -883,6 +883,10 @@ $("showMaps").addEventListener("change", (e) => {
   if (S.renderer) S.renderer.opt.showMaps = S.showMaps;
   redraw(0);
 });
+$("st-saliency").addEventListener("input", (e) => {
+  S.style.saliency = (e.target as HTMLInputElement).checked;
+  styleChanged();
+});
 $("showFrame").addEventListener("change", (e) => {
   S.showFrame = (e.target as HTMLInputElement).checked;
   if (S.renderer) S.renderer.opt.showFrame = S.showFrame;
@@ -1163,7 +1167,6 @@ const GROUPS: { title: string; ctls: Ctl[] }[] = [
       { key: "aiScale", label: "AI view size", type: "range", min: 0.3, max: 2, step: 0.05, unit: "×", only: "image" },
       { key: "recPos", label: "Recording", type: "select", options: [["auto", "Next to the AI view"], ...POS], only: "frames" },
       { key: "recScale", label: "Recording size", type: "range", min: 0.3, max: 2, step: 0.05, unit: "×", only: "frames" },
-      { key: "saliency", label: "Saliency heatmap (gradient × input)", type: "check", only: "image" },
       { key: "saliencyOpacity", label: "Heatmap opacity", type: "range", min: 0.1, max: 1, step: 0.05, unit: "×", only: "image" },
     ],
   },
@@ -1272,6 +1275,8 @@ function syncStyleUI() {
   const hasImage = !!S.viz?.imageInput;
   const hasFrames = !!S.rec?.get("frames");
   const hasMaps = !!S.viz?.cols.some((c) => c.maps);
+  $("saliencyRow").hidden = !hasImage;
+  $<HTMLInputElement>("st-saliency").checked = !!S.style.saliency;
   document.querySelectorAll<HTMLElement>("#styleGroups [data-only]").forEach((el) => {
     const o = el.dataset.only;
     el.hidden = o === "image" ? !hasImage : o === "frames" ? !hasFrames : !hasMaps;

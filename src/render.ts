@@ -58,7 +58,7 @@ export const DEFAULT_STYLE: Style = {
   nodeScale: 1, edgeMin: 1, edgeMax: 2.6, labelSize: 17, valueSize: 15, mapScale: 1, imageScale: 1,
   aiPos: "above", aiScale: 1, recPos: "auto", recScale: 1, colSpacing: 1, rowSpacing: 1, padding: 28, titles: true,
   glow: 1, pulse: true, pulseIntensity: 1, pos: "", neg: "", bg: "", shape: "circle", showValues: true, showProbs: true,
-  saliency: false, saliencyOpacity: 0.8,
+  saliency: true, saliencyOpacity: 0.8,
 };
 
 export interface Theme {
