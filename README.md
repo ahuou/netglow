@@ -97,6 +97,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | Conv node brightness | **summary**: spatial mean of the channel; spatial structure is not shown |
 | Through nonlinearities | **local**: contributions are into pre-activations; a ReLU that is off still draws its incoming edges. This is the linear part of the story, not a gradient through the whole network |
 | Node selection | heuristic: units with the largest mean |contribution| into the shown units of the next column, from the outputs backwards |
+| Node brightness curve | displayed as `v^0.7` of the normalised value (monotonic, lifts mid values) |
 | Input node colour | `|x[t] − x[t−1]|` over that input's 95th percentile on the recording (images: mean over pixels per channel) |
 
 ## Limitations (v0)

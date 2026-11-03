@@ -329,7 +329,8 @@ export class Renderer {
       ctx.arc(x, y, R, 0, Math.PI * 2);
       ctx.fill();
     }
-    ctx.fillStyle = mix(C.off, C.on, Math.max(0, Math.min(1, v)));
+    // gamma 0.7: perceptual lift so mid activations read as lit; still monotonic in the activation
+    ctx.fillStyle = mix(C.off, C.on, Math.max(0, Math.min(1, v)) ** 0.7);
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
