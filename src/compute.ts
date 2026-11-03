@@ -10,6 +10,10 @@
 //                                     (exact for the channel mean; bias excluded)
 //                             dense after a Concat: the same, on the slice of the weight columns that belongs to each branch
 //                             (W[j, off_b + i] * x_t[off_b + i], so every branch keeps its exact share)
+//                             skip (identity): x_t[j] into unit j (conv: the channel mean), the Add's other addend (exact)
+//                             skip (projection): the projection's own contribution, same rules as above (exact)
+//                             recurrent cell from below: W_c[j,i] * x_t[i] into the candidate gate's pre-activation
+//                             recurrent loop: R_c[j,k] * h_{t-1}[k] (GRU: times the reset gate r_t[j]) into the same
 //   column      - one vertical row of nodes: an input, each hidden layer, the output
 //   lane        - with several model inputs, each branch (input + its own layers) gets a horizontal band of the
 //                 canvas; columns after the Concat span the full height (lane -1)
@@ -17,9 +21,11 @@
 //   selection   - the units shown: output-driving units first, then backwards layer by layer
 //   robust norm - map values to 0..1 using the 5th and 95th percentile over the whole recording, so one spike
 //                 does not wash out the rest and flicker reflects real change
+//   consumer    - a column whose edges come from this one; with a skip, one column feeds two (the next layer and
+//                 the column after the block), and its units are picked by both
 
-import type { Layer, Plan } from "./analyze";
-import type { Trace } from "./run";
+import type { Layer, Plan, RnnCell } from "./analyze";
+import { episodeStarts, type Trace } from "./run";
 import { toFloat, type NdArray } from "./io/npy";
 
 export type OutputMode = "categorical" | "continuous";
@@ -48,6 +54,8 @@ export interface VizColumn {
   input?: number;
   base?: number;
   image?: boolean;
+  /** an LSTM / GRU hidden state (it also feeds itself on the next tick) */
+  recurrent?: "lstm" | "gru";
 }
 
 export interface VizEdges {
@@ -56,6 +64,10 @@ export interface VizEdges {
   /** T x to.sel.length x from.sel.length */
   c: Float32Array;
   scale: number;
+  /** skip = a residual connection around a block (drawn as an arc over it); recurrent = h(t-1) into the cell */
+  kind?: "skip" | "recurrent";
+  /** skip edges: identity or projection */
+  proj?: boolean;
 }
 
 export interface MatchCheck {
@@ -77,6 +89,10 @@ export interface Viz {
   /** number of lanes (1 for chain models) and stages */
   lanes: number;
   stages: number;
+  /** recurrent models: ticks where the state was reset (episode starts), and the largest difference between the
+   *  hidden state netglow recomputes from the cell weights and the one onnxruntime returned (a self-check) */
+  starts: Uint8Array | null;
+  rnnCheck: number | null;
 }
 
 export interface VizOptions {
@@ -156,9 +172,28 @@ function tapMeans(layer: Layer, src: { dims: number[]; size: number; data: Float
   return S;
 }
 
-/** contributions of every source group to the given targets: T x targets.length x G */
-function contributions(layer: Layer, src: TView, T: number, targets: number[], cache: Map<Layer, Float32Array>): { c: Float32Array; G: number } {
+/** contributions of every source group to the given targets: T x targets.length x G (layer null = identity skip) */
+function contributions(layer: Layer | null, src: TView, T: number, targets: number[], cache: Map<Layer, Float32Array>): { c: Float32Array; G: number } {
   const nt = targets.length;
+  if (!layer) {
+    // identity skip: unit d adds itself to unit d of the sum (a conv map: its channel mean)
+    const conv = src.dims.length === 3;
+    const G = conv ? src.dims[0] : src.size;
+    const gs = src.size / G;
+    const stride = src.stride ?? src.size;
+    const off = src.off ?? 0;
+    const out = new Float32Array(T * nt * G);
+    for (let t = 0; t < T; t++)
+      for (let jj = 0; jj < nt; jj++) {
+        const d = targets[jj];
+        if (d >= G) throw new Error(`An identity skip adds ${G} units to a layer that has more.`);
+        let v = 0;
+        const o = t * stride + off + d * gs;
+        for (let p = 0; p < gs; p++) v += src.data[o + p];
+        out[(t * nt + jj) * G + d] = v / gs;
+      }
+    return { c: out, G };
+  }
   if (layer.kind === "conv") {
     const C = src.dims[0];
     if (src.dims.length !== 3 || C !== layer.in) throw new Error(`Conv "${layer.node.name}" expects ${layer.in} input channels, got [${src.dims}].`);
@@ -240,7 +275,10 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
   // ---- columns and what feeds them: branches (input + own layers), then the trunk after the merge
   type Src = { ci: number; view: TView };
   const cols: VizColumn[] = [];
-  const feeds: { ci: number; layer: Layer; srcs: Src[] }[] = [];
+  /** layer null = identity skip */
+  const feeds: { ci: number; layer: Layer | null; srcs: Src[]; kind?: "skip" }[] = [];
+  const layerCol = new Map<Layer, number>();
+  const inputCol: number[] = [];
   const blank = (kind: VizColumn["kind"], label: string, lane: number, stage: number): VizColumn => ({ kind, label, lane, stage, n: 0, sel: [], order: [], v: new Float32Array(0) });
   const nbMax = Math.max(...plan.branches.map((b) => b.layers.length));
   const branchEnd: { ci: number; view: TView }[] = [];
@@ -256,9 +294,12 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
     col.image = inp.isImage;
     cols.push(col);
     let prev = cols.length - 1;
+    inputCol.push(prev);
     b.layers.forEach((l, li) => {
-      const view = li === 0 ? (trace.tensors.get(l.inTensor) ?? inView(b.input)) : get(b.layers[li - 1].actTensor);
+      const view = li === 0 ? (trace.tensors.get(l.inTensor) ?? inView(b.input)) : (trace.tensors.get(l.inTensor) ?? get(b.layers[li - 1].actTensor));
       cols.push(blank("hidden", l.label, lane, li + 1));
+      if (l.kind === "rnn") cols[cols.length - 1].recurrent = l.rnn!.type;
+      layerCol.set(l, cols.length - 1);
       feeds.push({ ci: cols.length - 1, layer: l, srcs: [{ ci: prev, view }] });
       prev = cols.length - 1;
     });
@@ -268,7 +309,9 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
     const isOut = li === plan.trunk.length - 1;
     cols.push(blank(isOut ? "output" : "hidden", isOut ? "output" : l.label, -1, nbMax + 1 + li));
     const ci = cols.length - 1;
-    if (li > 0) feeds.push({ ci, layer: l, srcs: [{ ci: ci - 1, view: get(plan.trunk[li - 1].actTensor) }] });
+    if (l.kind === "rnn") cols[ci].recurrent = l.rnn!.type;
+    layerCol.set(l, ci);
+    if (li > 0) feeds.push({ ci, layer: l, srcs: [{ ci: ci - 1, view: trace.tensors.get(l.inTensor) ?? get(plan.trunk[li - 1].actTensor) }] });
     else if (!multi) feeds.push({ ci, layer: l, srcs: [{ ci: branchEnd[0].ci, view: trace.tensors.get(l.inTensor) ?? branchEnd[0].view }] });
     else {
       // the dense layer after the Concat: read each branch's slice of its real input, in Concat order
@@ -288,6 +331,14 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
     }
   });
   const outCi = cols.length - 1;
+  // residual skips: the block input (or the projection's input) straight into the column after the block
+  for (const sk of plan.skips) {
+    const ci = layerCol.get(sk.to)!;
+    const from = sk.from ? layerCol.get(sk.from)! : inputCol[Math.max(0, sk.branch)];
+    const ii = plan.inputs.findIndex((i) => i.name === sk.src);
+    const view = trace.tensors.get(sk.src) ?? (ii >= 0 ? inView(ii) : get(sk.src));
+    feeds.push({ ci, layer: sk.proj, srcs: [{ ci: from, view }], kind: "skip" });
+  }
 
   // ---- output column values
   const logits = get(plan.outputTensor);
@@ -317,50 +368,86 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
   for (let t = 0; t < T; t++) for (let i = 0; i < nOut; i++) outMean[i] += prob[t * nOut + i];
   const outSel = nOut <= 16 ? [...Array(nOut).keys()] : topIdx(outMean, 16).sort((a, b) => a - b);
 
-  // ---- backwards selection: consumers come after their sources in `cols`, so walk the feeds in reverse
+  // ---- backwards selection: consumers come after their sources in `cols`, so walk the columns in reverse;
+  // a column's units are picked once every column it feeds has picked its own (scores from each consumer
+  // are normalised to sum 1 and added, so a skip and the next layer both have a say)
   const sels: number[][] = cols.map(() => []);
   sels[outCi] = outSel;
-  const edgeRaw: { from: number; to: number; c: Float32Array; meanAbs: Float64Array }[] = [];
-  for (let f = feeds.length - 1; f >= 0; f--) {
-    const { ci, layer, srcs } = feeds[f];
+  type EdgeRaw = { from: number; to: number; c: Float32Array; meanAbs: Float64Array; kind?: "skip" | "recurrent"; proj?: boolean };
+  const edgeRaw: EdgeRaw[] = [];
+  const pending: { to: number; c: Float32Array; G: number; kind?: "skip"; proj: boolean }[][] = cols.map(() => []);
+  const feedInto = (ci: number) => {
     const targets = sels[ci];
-    const nt = targets.length;
-    for (const src of srcs) {
-      const sc = cols[src.ci];
-      const { c, G } = contributions(layer, src.view, T, targets, cache);
-      const score = new Float64Array(G);
-      for (let t = 0; t < T; t++) for (let jj = 0; jj < nt; jj++) for (let g = 0; g < G; g++) score[g] += Math.abs(c[(t * nt + jj) * G + g]);
-      const isImageSrc = sc.kind === "input" && !!sc.image;
-      // an image input is one node: every channel of the stack is kept, then summed into one edge per target
-      const cap = isImageSrc ? G : sc.kind === "input" ? (G <= opt.maxInputs ? G : opt.nodesPerColumn) : opt.nodesPerColumn;
-      let sel = topIdx(score, cap);
-      if (sc.kind === "input") sel = sel.sort((a, b) => a - b);
-      const ns = sel.length;
+    for (const f of feeds)
+      if (f.ci === ci)
+        for (const src of f.srcs) {
+          const { c, G } = contributions(f.layer, src.view, T, targets, cache);
+          pending[src.ci].push({ to: ci, c, G, kind: f.kind, proj: !!f.layer });
+        }
+  };
+  feedInto(outCi);
+  for (let ci = outCi - 1; ci >= 0; ci--) {
+    const P = pending[ci];
+    const sc = cols[ci];
+    if (!P.length) continue;
+    const G = P[0].G;
+    if (P.some((q) => q.G !== G)) throw new Error(`Column ${sc.label} feeds layers that read it with different unit counts.`);
+    const score = new Float64Array(G);
+    for (const q of P) {
+      const nt = sels[q.to].length;
+      const part = new Float64Array(G);
+      let tot = 0;
+      for (let t = 0; t < T; t++)
+        for (let jj = 0; jj < nt; jj++)
+          for (let g = 0; g < G; g++) {
+            const a = Math.abs(q.c[(t * nt + jj) * G + g]);
+            part[g] += a;
+            tot += a;
+          }
+      for (let g = 0; g < G; g++) score[g] += tot > 0 ? part[g] / tot : 0;
+    }
+    const isImageSrc = sc.kind === "input" && !!sc.image;
+    // an image input is one node: every channel of the stack is kept, then summed into one edge per target
+    const cap = isImageSrc ? G : sc.kind === "input" ? (G <= opt.maxInputs ? G : opt.nodesPerColumn) : opt.nodesPerColumn;
+    let sel = topIdx(score, cap);
+    if (sc.kind === "input") sel = sel.sort((a, b) => a - b);
+    sels[ci] = isImageSrc ? [0] : sel;
+    const ns = sel.length;
+    for (const q of P) {
+      const nt = sels[q.to].length;
       const r = new Float32Array(T * nt * ns);
       const ma = new Float64Array(nt * ns);
       for (let t = 0; t < T; t++)
         for (let jj = 0; jj < nt; jj++)
           for (let ii = 0; ii < ns; ii++) {
-            const v = c[(t * nt + jj) * G + sel[ii]];
+            const v = q.c[(t * nt + jj) * G + sel[ii]];
             r[(t * nt + jj) * ns + ii] = v;
             ma[jj * ns + ii] += Math.abs(v) / T;
           }
       if (isImageSrc) {
         const r1 = new Float32Array(T * nt);
         const m1 = new Float64Array(nt);
-        for (let q = 0; q < T * nt; q++) {
+        for (let k = 0; k < T * nt; k++) {
           let sum = 0;
-          for (let ii = 0; ii < ns; ii++) sum += r[q * ns + ii];
-          r1[q] = sum;
-          m1[q % nt] += Math.abs(sum) / T;
+          for (let ii = 0; ii < ns; ii++) sum += r[k * ns + ii];
+          r1[k] = sum;
+          m1[k % nt] += Math.abs(sum) / T;
         }
-        sels[src.ci] = [0];
-        edgeRaw.push({ from: src.ci, to: ci, c: r1, meanAbs: m1 });
-        continue;
-      }
-      sels[src.ci] = sel;
-      edgeRaw.push({ from: src.ci, to: ci, c: r, meanAbs: ma });
+        edgeRaw.push({ from: ci, to: q.to, c: r1, meanAbs: m1, kind: q.kind, proj: q.proj });
+      } else edgeRaw.push({ from: ci, to: q.to, c: r, meanAbs: ma, kind: q.kind, proj: q.proj });
     }
+    feedInto(ci);
+  }
+
+  // ---- recurrent loops: h(t-1) of the shown units into the same units at tick t
+  let rnnCheck: number | null = null;
+  const starts = plan.states.length ? (trace.starts ?? episodeStarts(rec, T)) : null;
+  for (const l of plan.layers) {
+    if (l.kind !== "rnn") continue;
+    const ci = layerCol.get(l)!;
+    const r = recurrentEdges(l.rnn!, get(l.inTensor), get(l.rnn!.hOut), l.rnn!.cOut ? get(l.rnn!.cOut) : null, trace, starts!, sels[ci], T);
+    rnnCheck = Math.max(rnnCheck ?? 0, r.check);
+    edgeRaw.push({ from: ci, to: ci, c: r.c, meanAbs: r.meanAbs, kind: "recurrent" });
   }
 
   // ---- column values
@@ -408,7 +495,7 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
       }
       inputNo++;
     } else if (col.kind === "hidden") {
-      const l = feeds.find((f) => f.ci === ci)!.layer;
+      const l = feeds.find((f) => f.ci === ci && !f.kind)!.layer!;
       const act = get(l.actTensor);
       const u = unitValues(act, T);
       const vals = new Float32Array(T * ns);
@@ -432,7 +519,7 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
     scaleTo.set(to, Math.max(percentile(all, 95), 1e-9));
   }
   edgeRaw.sort((a, b) => a.to - b.to || a.from - b.from);
-  const edges: VizEdges[] = edgeRaw.map((e) => ({ from: e.from, to: e.to, c: e.c, scale: scaleTo.get(e.to)! }));
+  const edges: VizEdges[] = edgeRaw.map((e) => ({ from: e.from, to: e.to, c: e.c, scale: scaleTo.get(e.to)!, kind: e.kind, proj: e.kind === "skip" ? e.proj : undefined }));
 
   const viz: Viz = {
     T, cols, edges, chosen, mode,
@@ -440,6 +527,8 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
     imageInput,
     lanes: multi ? plan.branches.length : 1,
     stages: nbMax + 1 + plan.trunk.length,
+    starts,
+    rnnCheck,
   };
   (viz as VizInternal)._meanAbs = edgeRaw.map((e) => e.meanAbs);
   orderHidden(viz);
@@ -474,7 +563,7 @@ export function orderHidden(viz: Viz) {
   for (let ci = viz.cols.length - 2; ci >= 0; ci--) {
     const col = viz.cols[ci];
     if (col.kind !== "hidden") continue;
-    const ei = viz.edges.findIndex((e) => e.from === ci);
+    const ei = viz.edges.findIndex((e) => e.from === ci && !e.kind);
     if (ei < 0) continue;
     const next = viz.cols[viz.edges[ei].to];
     const ma = meanAbs[ei]; // edges ci -> next: (next.sel x col.sel)
@@ -494,6 +583,79 @@ export function orderHidden(viz: Viz) {
     }
     col.order = [...Array(ns).keys()].sort((a, b) => bc[a] - bc[b]);
   }
+}
+
+const sig = (x: number) => 1 / (1 + Math.exp(-x));
+
+/**
+ * The recurrent loop of one cell: contribution of h_{t-1}[k] to the candidate gate's pre-activation of unit j,
+ * for the shown units. The cell is recomputed in JS from its weights (to get the GRU's reset gate), and the
+ * recomputed h_t is compared with onnxruntime's as a self-check.
+ */
+function recurrentEdges(
+  cell: RnnCell, x: { size: number; data: Float32Array }, hOut: { size: number; data: Float32Array }, cOut: { size: number; data: Float32Array } | null,
+  trace: Trace, starts: Uint8Array, sel: number[], T: number,
+) {
+  const { H, I, Wx, R, B, gates } = cell;
+  const ns = sel.length;
+  const out = new Float32Array(T * ns * ns);
+  const meanAbs = new Float64Array(ns * ns);
+  const h0 = trace.init?.get(cell.hIn) ?? new Float32Array(H);
+  const c0 = (cell.cIn && trace.init?.get(cell.cIn)) || new Float32Array(H);
+  const z = new Float64Array(gates * H);
+  let check = 0;
+  for (let t = 0; t < T; t++) {
+    const hp = starts[t] ? h0 : hOut.data.subarray((t - 1) * H, t * H);
+    const cp = starts[t] ? c0 : cOut ? cOut.data.subarray((t - 1) * H, t * H) : c0;
+    const xt = x.data.subarray(t * x.size, t * x.size + I);
+    // gate pre-activations without the recurrent part, then with it (GRU's candidate keeps them apart)
+    const zx = new Float64Array(gates * H);
+    const zh = new Float64Array(gates * H);
+    for (let g = 0; g < gates * H; g++) {
+      let a = B[g];
+      for (let i = 0; i < I; i++) a += Wx[g * I + i] * xt[i];
+      let b = B[gates * H + g];
+      for (let k = 0; k < H; k++) b += R[g * H + k] * hp[k];
+      zx[g] = a;
+      zh[g] = b;
+      z[g] = a + b;
+    }
+    const hNow = hOut.data.subarray(t * H, (t + 1) * H);
+    let rGate: Float64Array | null = null;
+    if (cell.type === "lstm") {
+      for (let j = 0; j < H; j++) {
+        const ig = sig(z[j]), og = sig(z[H + j]), fg = sig(z[2 * H + j]), gg = Math.tanh(z[3 * H + j]);
+        const c = fg * cp[j] + ig * gg;
+        check = Math.max(check, Math.abs(og * Math.tanh(c) - hNow[j]));
+      }
+    } else {
+      rGate = new Float64Array(H);
+      for (let j = 0; j < H; j++) {
+        const zg = sig(z[j]);
+        const rg = sig(z[H + j]);
+        rGate[j] = rg;
+        let n: number;
+        if (cell.linearBeforeReset) n = Math.tanh(zx[2 * H + j] + rg * zh[2 * H + j]);
+        else {
+          let a = zx[2 * H + j] + B[gates * H + 2 * H + j];
+          for (let k = 0; k < H; k++) a += R[(2 * H + j) * H + k] * rg * hp[k];
+          n = Math.tanh(a);
+        }
+        check = Math.max(check, Math.abs((1 - zg) * n + zg * hp[j] - hNow[j]));
+      }
+    }
+    for (let jj = 0; jj < ns; jj++) {
+      const j = sel[jj];
+      for (let kk = 0; kk < ns; kk++) {
+        const k = sel[kk];
+        // GRU: linear_before_reset multiplies the whole recurrent term by r_j; otherwise r gates h_k itself
+        const v = !rGate ? cell.Rc[j * H + k] * hp[k] : cell.linearBeforeReset ? rGate[j] * cell.Rc[j * H + k] * hp[k] : cell.Rc[j * H + k] * rGate[k] * hp[k];
+        out[(t * ns + jj) * ns + kk] = v;
+        meanAbs[jj * ns + kk] += Math.abs(v) / T;
+      }
+    }
+  }
+  return { c: out, meanAbs, check };
 }
 
 function matchCheck(plan: Plan, trace: Trace, rec: Map<string, NdArray>, chosen: Int32Array | null, mode: OutputMode): MatchCheck {

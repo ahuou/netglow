@@ -7,6 +7,8 @@
 //   output  - one node per output with its icon; glow = probability, the chosen (argmax) one is ringed and lit
 //   edges   - per target node, the top-k sources by |contribution| this tick; warm = excites, cool = inhibits
 //   pulse   - a faint band sweeping left to right once per decision tick
+//   skip    - a residual connection: an arc from the block's input column over the block into the column after it
+//   loop    - a recurrent cell's h(t-1) -> h(t) edges, dashed loops on the right of its column
 // Image models: the input column is one image node (the current frame, pixels kept visible, border lit by how
 // much the frame changed), optionally a large "What the AI sees" view above or beside the network, and conv
 // channels can be drawn as their live feature maps instead of dots.
@@ -214,6 +216,10 @@ export class Renderer {
   boxes: Box[] = [];
   /** uniform shrink applied because the content did not fit the width at full size (1 = none) */
   fit = 1;
+  /** per edge set (index into viz.edges): the y where its skip arcs peak */
+  skipPeak = new Map<number, number>();
+  /** per recurrent column: how far its loops may bulge to the right */
+  loopRoom = new Map<number, number>();
   private bandTop = 0;
   private textX = 28;
   private titleLo = 0;
@@ -402,7 +408,9 @@ export class Renderer {
       this.mapSize = Math.max(4, this.mapSize);
     };
     const titleRow = 15 * u;
-    let top = this.headerY + titleRow / 2 + 26 * u;
+    // skip arcs run between the titles and the columns: give them a rail's worth of room
+    const arcRoom = this.viz.edges.some((e) => e.kind === "skip") ? 24 * u : 0;
+    let top = this.headerY + titleRow / 2 + 26 * u + arcRoom;
     vertical(top);
 
     // ---- text widths, measured: input labels and values on the left, output pills and values on the right
@@ -458,7 +466,8 @@ export class Renderer {
     const halfL = new Array(stages).fill(0);
     cols.forEach((c, ci) => {
       const hw = c.image ? 2 * u : isMap(c) ? this.mapSize / 2 + 2 * u : ci === outCi ? r + 4.5 * u : r;
-      halfR[c.stage] = Math.max(halfR[c.stage], hw);
+      // a recurrent column's loops bulge out to its right
+      halfR[c.stage] = Math.max(halfR[c.stage], hw + (c.recurrent ? 42 * u : 0));
       halfL[c.stage] = Math.max(halfL[c.stage], c.image ? 0 : hw);
     });
     const minSp = Array.from({ length: Math.max(0, stages - 1) }, (_, i) => halfR[i] + halfL[i + 1] + 30 * u);
@@ -488,8 +497,8 @@ export class Renderer {
     this.titleBoxes = st.titles ? this.placeTitles(ctx, u) : [];
     // a second title row below the first pushes the columns down
     const titleBottom = Math.max(this.headerY + titleRow / 2, ...this.titleBoxes.map((t) => t.y1));
-    if (titleBottom + 26 * u > top) {
-      top = titleBottom + 26 * u;
+    if (titleBottom + 26 * u + arcRoom > top) {
+      top = titleBottom + 26 * u + arcRoom;
       vertical(top);
     }
 
@@ -513,6 +522,38 @@ export class Renderer {
       this.imgRect[1] = y;
       this.Y[imgCol][0] = y + th / 2;
     }
+
+    // ---- recurrent loops: room to the right of the column, half the way to the next one
+    this.loopRoom.clear();
+    cols.forEach((c, ci) => {
+      if (!c.recurrent) return;
+      const next = Math.min(...cols.filter((d) => d.stage === c.stage + 1).map((d) => this.X[cols.indexOf(d)] - this.half[cols.indexOf(d)]));
+      const room = Math.max(14 * u, Math.min(64 * u, (next - this.X[ci] - this.half[ci]) * 0.55));
+      this.loopRoom.set(ci, room);
+      const yb = Math.max(...this.Y[ci]) + r + 16 * u;
+      const lw = measure("h(t−1)", font(500, 11 * u));
+      const x0 = this.X[ci] + this.half[ci] + 4 * u;
+      boxes.push({ kind: `loop label ${ci}`, x0, x1: x0 + lw, y0: yb - 11 * u * 0.6, y1: yb + 11 * u * 0.4 });
+    });
+
+    // ---- skip arcs peak above the columns they bypass, below the titles (and inside their lane)
+    this.skipPeak.clear();
+    const titleFloor = Math.max(this.headerY + titleRow / 2, ...this.titleBoxes.map((t) => t.y1));
+    this.viz.edges.forEach((e, ei) => {
+      if (e.kind !== "skip") return;
+      const a = cols[e.from], b = cols[e.to];
+      const lane = b.lane >= 0 ? b.lane : a.lane;
+      let yTop = Math.min(...this.Y[e.from], ...this.Y[e.to]) - r;
+      cols.forEach((c, ci) => {
+        if (c.stage > a.stage && c.stage < b.stage && (c.lane === lane || c.lane < 0 || lane < 0)) yTop = Math.min(yTop, Math.min(...this.Y[ci]) - (isMap(c) ? this.mapSize / 2 : r));
+      });
+      const floor = lanes > 1 && lane > 0 ? band[e.to][0] - laneGap * 0.3 : titleFloor + 24 * u;
+      const y = Math.max(floor, yTop - 16 * u);
+      this.skipPeak.set(ei, y);
+      const xm = (this.X[e.from] + this.X[e.to]) / 2;
+      const lw = measure(e.proj ? "projection" : "skip", font(500, 11 * u));
+      boxes.push({ kind: `skip label ${ei}`, x0: xm - lw / 2, x1: xm + lw / 2, y0: y - 9 * u - 11 * u * 0.6, y1: y - 9 * u + 11 * u * 0.4 });
+    });
 
     // ---- boxes, for overlap checks
     for (const t of this.titleBoxes) boxes.push({ kind: `title ${t.text}`, x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 });
@@ -720,7 +761,7 @@ export class Renderer {
 
     // edges
     ctx.lineCap = "round";
-    for (const e of viz.edges) {
+    viz.edges.forEach((e, ei) => {
       const from = viz.cols[e.from];
       const to = viz.cols[e.to];
       const nf = from.sel.length;
@@ -729,6 +770,22 @@ export class Renderer {
       const xd = this.X[e.to] - this.half[e.to];
       const kk = Math.min(o.topK, nf);
       const base = k * nt * nf;
+      const peak = this.skipPeak.get(ei);
+      if (e.kind === "skip" && peak !== undefined) {
+        ctx.font = `500 ${11 * s}px ${SANS}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
+        ctx.fillStyle = th.dim;
+        ctx.fillText(e.proj ? "projection" : "skip", (this.X[e.from] + this.X[e.to]) / 2, peak - 9 * s);
+      }
+      if (e.kind === "recurrent") {
+        ctx.font = `500 ${11 * s}px ${SANS}`;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+        ctx.fillStyle = th.dim;
+        ctx.fillText("h(t−1)", this.X[e.to] + this.half[e.to] + 4 * s, Math.max(...this.Y[e.to]) + this.r + 16 * s + 4 * s);
+        ctx.setLineDash([4 * s, 3.5 * s]);
+      }
       for (let j = 0; j < nt; j++) {
         const row = e.c.subarray(base + j * nf, base + (j + 1) * nf);
         const idx = topK(row, kk);
@@ -741,13 +798,32 @@ export class Renderer {
           ctx.beginPath();
           const y0 = this.Y[e.from][i];
           const y1 = this.Y[e.to][j];
-          const mx = (xs + xd) / 2;
-          ctx.moveTo(xs, y0);
-          ctx.bezierCurveTo(mx, y0, mx, y1, xd, y1);
+          if (peak !== undefined) {
+            // over the block: rise to a rail above it, run along the rail, come down into the target
+            const w = Math.min((xd - xs) * 0.3, 90 * s);
+            ctx.moveTo(xs, y0);
+            ctx.bezierCurveTo(xs + w * 0.55, y0, xs + w * 0.45, peak, xs + w, peak);
+            ctx.lineTo(xd - w, peak);
+            ctx.bezierCurveTo(xd - w * 0.45, peak, xd - w * 0.55, y1, xd, y1);
+          } else if (e.kind === "recurrent") {
+            // h(t-1) of unit i into unit j: a loop out to the right of the column and back
+            const x = this.X[e.to] + this.half[e.to] + 2 * s;
+            const same = i === j;
+            const ya = same ? y0 - 3.5 * s : y0;
+            const yb = same ? y1 + 3.5 * s : y1;
+            const bulge = Math.min(this.loopRoom.get(e.to) ?? 40 * s, 12 * s + Math.abs(y1 - y0) * 0.45);
+            ctx.moveTo(x, ya);
+            ctx.bezierCurveTo(x + bulge, ya, x + bulge, yb, x, yb);
+          } else {
+            const mx = (xs + xd) / 2;
+            ctx.moveTo(xs, y0);
+            ctx.bezierCurveTo(mx, y0, mx, y1, xd, y1);
+          }
           ctx.stroke();
         }
       }
-    }
+      if (e.kind === "recurrent") ctx.setLineDash([]);
+    });
 
     // pictures: recording render and what the AI sees, each with a caption
     for (const p of this.pics) {

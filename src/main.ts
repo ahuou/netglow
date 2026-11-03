@@ -34,6 +34,7 @@ const DEMOS = [
   { id: "lunar-mlp", title: "LunarLander, MLP", sub: "PPO policy reading 8 numbers" },
   { id: "lunar-cnn", title: "LunarLander, CNN", sub: "a CNN pilot that flies from pixels" },
   { id: "lunar-mixed", title: "LunarLander, pixels + numbers", sub: "two inputs: frames and 6 plain numbers" },
+  { id: "lunar-resmlp", title: "LunarLander, residual MLP", sub: "a skip connection around a two-layer block" },
 ];
 
 const S = {
@@ -262,7 +263,7 @@ async function rebuild(rerun: boolean) {
       ($("mode") as HTMLSelectElement).value = S.mode;
     }
     busy(true, "Running the model in this tab…", 0);
-    S.trace = await runTrace(S.model, S.plan, S.obsList, (f) => busy(true, "Running the model in this tab…", f));
+    S.trace = await runTrace(S.model, S.plan, S.obsList, (f) => busy(true, "Running the model in this tab…", f), S.rec);
     busy(false);
   }
   const prev = S.viz ? { inputs: S.viz.cols.filter((c) => c.kind === "input").map((c) => c.order), output: S.viz.cols[S.viz.cols.length - 1].order } : undefined;

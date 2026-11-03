@@ -5,7 +5,7 @@ Drop in a neural network and a recording of its inputs, and get an animated "glo
 video never leave your machine.
 
 **Try it: [ahuou.github.io/netglow](https://ahuou.github.io/netglow/)** (demos: [MLP](https://ahuou.github.io/netglow/?demo=lunar-mlp),
-[CNN](https://ahuou.github.io/netglow/?demo=lunar-cnn), [pixels + numbers](https://ahuou.github.io/netglow/?demo=lunar-mixed)).
+[CNN](https://ahuou.github.io/netglow/?demo=lunar-cnn), [pixels + numbers](https://ahuou.github.io/netglow/?demo=lunar-mixed), [residual MLP](https://ahuou.github.io/netglow/?demo=lunar-resmlp)).
 
 ![netglow showing a LunarLander PPO policy](docs/screenshot.png)
 
@@ -54,6 +54,23 @@ video never leave your machine.
 - Demo **LunarLander, pixels + numbers** (`?demo=lunar-mixed`): 64×64 frames plus x / y speed, angle, spin and
   leg contacts. It landed 50 of 50 fresh seeds (mean return 276); with the velocities handed over as numbers the
   task is much easier than flying from pixels alone (the CNN demo landed 11 of 20 eval seeds).
+
+### Skip connections
+
+![netglow showing a residual MLP pilot with an identity skip around a two-layer block](docs/residual.png)
+
+- ResNet-style blocks, `Add(block(x), x)` with an identity skip or `Add(block(x), P(x))` with one projection layer
+  (`Gemm`, `MatMul` or a `Conv`, e.g. 1×1 stride 2), in dense MLPs and in conv stacks, also inside one branch of a
+  multi-input model.
+- The main path stays a row of columns; the skip is drawn as a rail **over the block** from the block's input
+  column into the column after it, labelled `skip` or `projection`.
+- Attribution at the `Add` is split exactly between its two addends: the block's last layer contributes
+  `W[j, i] · a[i]` as usual, the identity skip contributes `x[j]` to unit `j` (a conv map: its channel mean),
+  a projection `P[j, i] · x[i]`. Both edge sets into a column share one scale.
+- A column that feeds both the next layer and a skip picks its shown units from both consumers.
+- Demo **LunarLander, residual MLP** (`?demo=lunar-resmlp`): dense 64, then a block of two dense 64 layers with an
+  identity skip, taught to imitate the PPO expert (behaviour cloning + DAgger). It landed 50 of 50 fresh seeds
+  (mean return 270).
 
 ## 30-second quickstart
 
@@ -122,12 +139,13 @@ their row pitch, and when even that does not fit, the whole picture is scaled do
   Or several inputs, each with its own chain, joined by one `Concat` (axis 1) that feeds a dense layer; at most one
   of them an image.
 - Batch axis dynamic or fixed at 1. Weights embedded in the file (no external data).
-- Chain-shaped: every node on the signal path has exactly one signal input. Supported weighted layers:
+- Chain-shaped: every node on the signal path has exactly one signal input, except a residual `Add` (block + identity
+  or one projection layer). Supported weighted layers:
   `Gemm`, `MatMul` (constant weight on the right), `Conv` (group 1, explicit pads). Anything elementwise or
   reshaping between them is fine (`Relu`, `Tanh`, `BatchNormalization`, `MaxPool`, `Flatten`, ...).
 - The first graph output is shown. A trailing `Softmax` is detected and the logits before it are used.
 
-Graphs outside this shape (skip connections, gating, a Concat inside a branch, attention, recurrent cells) are
+Graphs outside this shape (gating, a Concat inside a branch, two parallel multi-layer branches added, attention) are
 rejected with a message that names the node where the chain breaks.
 
 ### Recording: `.npz`, `.npy` or `.json`
@@ -180,6 +198,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | Dense ← conv edges (after `Flatten`) | **exact** per channel: `Σ_pixels W[j, c, p] · a[c, p]` |
 | Conv ← conv edges | **exact for the channel mean**: contribution of input channel *c* to the spatial mean of output channel *d*'s pre-activation, `Σ_taps W[d,c,k] · mean(a[c] at the pixels tap k reads)` |
 | Conv node brightness | **summary**: spatial mean of the channel; the feature-map toggle shows the full map |
+| Skip edges (`Add`) | **exact** split: identity `x[j]` into unit *j* (conv: channel mean), projection `P[j,i] · x[i]`; the block's own edges are its last layer's `W[j,i] · a[i]`. If a nonlinearity sits between that layer and the `Add`, the block edges are into that layer's pre-activation (a note says so) |
 | Image node edges | **exact**, summed: the per-channel conv contributions of every channel in the stack, added up |
 | Through nonlinearities | **local**: contributions are into pre-activations; a ReLU that is off still draws its incoming edges. This is the linear part of the story, not a gradient through the whole network |
 | Node selection | heuristic: units with the largest mean |contribution| into the shown units of the next column, from the outputs backwards |
@@ -188,7 +207,8 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 
 ## Limitations (v0)
 
-- Chain-shaped graphs, or several input branches joined by one `Concat`. No residuals, RNN / attention.
+- Chain-shaped graphs with residual blocks, or several input branches joined by one `Concat`. No attention, no
+  gating (`Mul` of two signals), no nested residuals (a block inside a block).
 - At most one image input per model.
 - Image inputs must be channels-first `[N, C, H, W]`; a channels-last model (leading `Transpose`) is rejected.
 - Grouped / depthwise convolutions are rejected; `Transpose` between conv and dense is warned about.
@@ -203,7 +223,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | File | Owns |
 | --- | --- |
 | `src/onnx/proto.ts` | reading ONNX protobuf (nodes, weights, value infos) and appending graph outputs |
-| `src/analyze.ts` | finding the weighted layers (per input branch, then the trunk after the Concat) and which tensors to fetch |
+| `src/analyze.ts` | finding the weighted layers (per input branch, then the trunk after the Concat), residual skips, and which tensors to fetch |
 | `src/run.ts` | onnxruntime-web session, batched run over the recording |
 | `src/compute.ts` | contributions, node selection, normalisation, match check |
 | `src/render.ts` | drawing one frame on a canvas, themes, image node, feature maps, hit-testing for drag |
@@ -219,10 +239,12 @@ MIT
 
 ## Tests
 
-With `npm run dev -- --port 5181` running (fixtures come from `test/make_fixtures.py`):
+With `npm run dev -- --port 5181` running (fixtures come from `test/make_fixtures.py` and `test/fixtures/make_v2.py`;
+the extra demos from `test/fixtures/demos_v2.py`):
 
 ```bash
-node test/smoke.mjs mlp        # also: cnn, rgbf, mixed, residual (expects a clear rejection), demo:lunar-mlp
+node test/smoke.mjs mlp        # also: cnn, rgbf, mixed, resmlp, rescnn, gated (expects a clear rejection), demo:lunar-mlp
+node test/residual.mjs         # skips: exact split at the Add, arcs over the block, no overlaps, rejection of gating
 node test/mixed.mjs            # two-input demo: match, lanes, edges from both branches, drag, short GIF
 node test/panel.mjs            # extreme sizes: no picture, label, title or column overlaps another
 node test/image.mjs            # image node, AI view, feature maps, pixel-range detection
