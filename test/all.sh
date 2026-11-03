@@ -15,7 +15,7 @@ smoke() { # smoke.mjs only prints; a demo or fixture must load and match
   if grep -q '"pill": "Match 100%"' <<<"$out" && ! grep -q "pageerror" <<<"$out"; then echo "ok   smoke $1"; else echo "FAIL smoke $1"; echo "$out" | tail -12; fail=1; fi
 }
 for f in mlp cnn rgbf mixed resmlp rescnn lstm gru ${EXTRA_SMOKE:-}; do smoke "$f"; done
-for t in ${TESTS:-mixed image drag panel settings residual recurrent saliency compare}; do run "$t" node "test/$t.mjs"; done
+for t in ${TESTS:-mixed image drag panel settings residual recurrent saliency compare polish}; do run "$t" node "test/$t.mjs"; done
 run shots node test/shots.mjs
 mkdir -p test/exports
 run "export gif" node test/export.mjs mlp gif test/exports/all-mlp.gif 960x540 30 1

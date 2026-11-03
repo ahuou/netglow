@@ -19,6 +19,7 @@ import { DEFAULT_STYLE, type PicPos, type Style } from "./render";
 import { computeSaliency, type SaliencyMap } from "./saliency";
 import { CompareRenderer, type CompareLayout } from "./compare";
 import type { RenderOpts } from "./render";
+import { legendHTML } from "./legend";
 import { DEFAULT_SETTINGS, clearStored, clone, diff, fromHash, loadStored, merge, store, toHash, type Settings } from "./settings";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -103,6 +104,10 @@ const S = {
   sal: null as SaliencyMap | null,
   salFor: null as Viz | null,
   lastUrl: "",
+  lastBlob: null as Blob | null,
+  lastExt: "",
+  /** the bundled demo on screen (null for the visitor's own files): embeds can point at it */
+  demoId: null as string | null,
 };
 
 const view = $<HTMLCanvasElement>("view");
@@ -122,6 +127,7 @@ function busy(on: boolean, text = "", f = 0) {
 
 // ---------- loading ----------
 async function loadModelBytes(bytes: Uint8Array, name: string) {
+  S.demoId = null;
   S.model = null;
   S.plan = null;
   S.modelName = name;
@@ -251,6 +257,7 @@ async function loadDemo(id: string) {
     );
     markFile("labels", "labels.json + icons");
     await loadModelBytes(m, `${id}/model.onnx`);
+    S.demoId = id;
     await loadRecording(rec, `${id}/recording.npz`);
     S.showFrame = !!S.rec?.get("frames");
     ($("showFrame") as HTMLInputElement).checked = S.showFrame;
@@ -312,6 +319,8 @@ async function rebuild(rerun: boolean) {
   renderLabelsPanel();
   renderMatch();
   syncStyleUI();
+  renderLegend();
+  renderEmbed();
   $("empty").hidden = true;
   $("docTitle").textContent = S.labelsFile?.title ?? S.modelName.replace(/\.onnx$/, "");
   for (const id of ["play", "scrub", "exportBtn", "exportTop"]) ($(id) as HTMLButtonElement).disabled = false;
@@ -823,6 +832,7 @@ themeSeg.addEventListener("click", (e) => {
   S.theme = THEMES.find((t) => t.id === b.dataset.theme)!;
   themeSeg.querySelectorAll("button").forEach((x) => x.setAttribute("aria-checked", String(x === b)));
   if (S.renderer) S.renderer.opt.theme = S.theme;
+  renderLegend();
   drawRibbon();
   redraw(0);
 });
@@ -972,6 +982,9 @@ async function doExport() {
     });
     if (S.lastUrl) URL.revokeObjectURL(S.lastUrl);
     S.lastUrl = URL.createObjectURL(res.blob);
+    S.lastBlob = res.blob;
+    S.lastExt = res.ext;
+    ($("playerPage") as HTMLButtonElement).disabled = false;
     const name = `${(S.labels.title || "netglow").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}.${res.ext}`;
     const a = document.createElement("a");
     a.href = S.lastUrl;
@@ -997,13 +1010,120 @@ $("exportTop").addEventListener("click", doExport);
 $("exportCancel").addEventListener("click", () => S.exportAbort?.abort());
 window.addEventListener("resize", () => drawRibbon());
 
+// ---------- "What am I looking at" ----------
+const LEGEND_KEY = "netglow:legend-seen:v1";
+const embed = new URLSearchParams(location.search).get("embed") === "1";
+function renderLegend() {
+  const V = S.viz;
+  $("legendList").innerHTML = legendHTML(S.theme, S.style.pos || S.theme.pos, S.style.neg || S.theme.neg, {
+    image: !!V?.imageInput, maps: !!V?.cols.some((c) => c.maps) && S.showMaps, skip: !!V?.edges.some((e) => e.kind === "skip"),
+    recurrent: !!V?.edges.some((e) => e.kind === "recurrent"), saliency: !!S.style.saliency && !!S.plan?.saliency && !S.plan.saliency.error, compare: !!S.cmp?.viz,
+  });
+}
+function showLegend(on: boolean) {
+  $("legend").hidden = !on;
+  $("legendBtn").setAttribute("aria-expanded", String(on));
+  if (on) {
+    renderLegend();
+    ($("legendOk") as HTMLButtonElement).focus({ preventScroll: true });
+  } else {
+    try {
+      localStorage.setItem(LEGEND_KEY, "1");
+    } catch {
+      /* private mode: it shows again next time */
+    }
+  }
+}
+$("legendBtn").addEventListener("click", () => showLegend($("legend").hidden));
+$("legendClose").addEventListener("click", () => showLegend(false));
+$("legendOk").addEventListener("click", () => {
+  showLegend(false);
+  $("legendBtn").focus();
+});
+$("legend").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    showLegend(false);
+    $("legendBtn").focus();
+  }
+});
+let legendSeen = false;
+try {
+  legendSeen = localStorage.getItem(LEGEND_KEY) === "1";
+} catch {
+  legendSeen = false;
+}
+
+// ---------- embed ----------
+/** an <iframe> of the hosted app in ?embed=1 mode for a bundled demo; for your own files, a self-contained player page */
+function embedCode(): string {
+  const [w, h] = [view.width, view.height];
+  const title = (S.labels?.title ?? "netglow").replace(/"/g, "&quot;");
+  const dw = Math.min(720, w);
+  const dh = Math.round((dw * h) / w);
+  if (S.demoId) {
+    const src = `${location.origin}${location.pathname}?demo=${encodeURIComponent(S.demoId)}&embed=1${toHash(collectSettings())}`;
+    return `<iframe src="${src}" width="${dw}" height="${dh}" style="border:0;max-width:100%;aspect-ratio:${w}/${h};height:auto" loading="lazy" title="netglow: ${title}"></iframe>`;
+  }
+  return `<iframe src="netglow-player.html" width="${dw}" height="${dh}" style="border:0;max-width:100%;aspect-ratio:${w}/${h};height:auto" loading="lazy" title="netglow: ${title}"></iframe>`;
+}
+function renderEmbed() {
+  if (!S.viz) return;
+  ($("embedCode") as HTMLTextAreaElement).value = embedCode();
+  $("embedNote").textContent = S.demoId
+    ? "Plays this demo with this look on any page (the hosted app in a chrome-less embed mode)."
+    : "Your files stay on your machine, so the embed plays an export: export first (MP4 or WebM stay smallest), then download the player page and host it next to your page.";
+}
+$("copyEmbed").addEventListener("click", async () => {
+  renderEmbed();
+  const code = ($("embedCode") as HTMLTextAreaElement).value;
+  try {
+    await navigator.clipboard.writeText(code);
+    $("embedNote").textContent = "Embed code copied.";
+  } catch {
+    ($("embedCode") as HTMLTextAreaElement).select();
+    $("embedNote").textContent = "Select the code above and copy it.";
+  }
+});
+$("playerPage").addEventListener("click", async () => {
+  if (!S.lastBlob) return;
+  const data = await new Promise<string>((res) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result));
+    r.readAsDataURL(S.lastBlob!);
+  });
+  const title = esc(S.labels?.title ?? "netglow");
+  const media = S.lastExt === "gif" ? `<img src="${data}" alt="${title}">` : `<video src="${data}" autoplay loop muted playsinline aria-label="${title}"></video>`;
+  const html = `<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title>
+<style>html,body{margin:0;height:100%;background:${S.transparent ? "transparent" : S.style.bg || S.theme.bg}}body{display:grid;place-items:center}img,video{max-width:100%;max-height:100vh;display:block}</style></head>
+<body>${media}<script>if(matchMedia("(prefers-reduced-motion: reduce)").matches){const v=document.querySelector("video");if(v){v.pause();v.controls=true}}</script></body></html>\n`;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+  a.download = "netglow-player.html";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+if (embed) {
+  document.body.classList.add("embed");
+  const link = document.createElement("a");
+  link.className = "embed-link";
+  link.href = location.href.replace(/[?&]embed=1/, "");
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.textContent = "netglow ↗";
+  $("well").appendChild(link);
+  // click or Space (the window's key handler) plays and pauses; the canvas takes focus so Space reaches it
+  view.tabIndex = 0;
+  view.addEventListener("click", () => (S.playing ? stop() : play()));
+}
+
 // test / automation hook
-(window as unknown as { netglow: unknown }).netglow = { S, loadDemo, handleFiles, redraw, play, stop };
+(window as unknown as { netglow: unknown }).netglow = { S, loadDemo, handleFiles, redraw, play, stop, showLegend };
 
 // first open: load the MLP demo so the page shows a live network straight away (?demo=none keeps it empty)
 const q = new URLSearchParams(location.search).get("demo") ?? "lunar-mlp";
 if (q !== "none")
   loadDemo(q).then(() => {
+    if (!embed && !legendSeen && S.viz) showLegend(true);
     if (S.viz && !matchMedia("(prefers-reduced-motion: reduce)").matches && !new URLSearchParams(location.search).has("paused")) play();
   });
 
@@ -1168,6 +1288,8 @@ function styleChanged() {
   if (S.renderer) {
     S.renderer.opt.style = S.style;
     S.renderer.opt.saliency = ensureSaliency();
+    renderLegend();
+    renderEmbed();
     if (S.renderer instanceof CompareRenderer && S.cmp) S.renderer.b.opt.saliency = cmpSaliency(S.cmp);
     redraw(0);
   }

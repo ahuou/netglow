@@ -121,6 +121,21 @@ video never leave your machine.
   at 1M steps (landed 49 of 50 fresh seeds, mean return 266) and the same training run at 60k steps (landed 7 of 50,
   mean return −68). They choose the same action on 24 % of the ticks.
 
+### First visit, embedding
+
+![the first-visit key over the residual MLP demo](docs/legend.png)
+
+- **What am I looking at**: a one-screen key opens over the first demo for first-time visitors (nodes = units,
+  glow = activation, edges = contribution, the theme's excite / inhibit colours, plus skips, loops, the image node
+  and the heatmap when the net has them). It is not part of the canvas, so never in exports. Dismiss it once and
+  it stays closed; `?` in the top bar opens it again.
+- **Embed** (Export panel): for a bundled demo, a copyable `<iframe>` of the hosted app in a chrome-less mode,
+  `?demo=<id>&embed=1#look=…` (only the picture, it loops; click or Space pauses; a small link opens the full app).
+  For your own files, which never leave your machine, export first and **Download player page**: one
+  self-contained HTML file with the export inside, plus the `<iframe>` snippet to host it next to your page.
+- At large sizes, when the width forces everything to shrink, rows still spread over the free height instead of
+  the network shrinking into the middle.
+
 ## 30-second quickstart
 
 ```bash
@@ -286,6 +301,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | `src/settings.ts` | the settings object: defaults, merge, localStorage, JSON and share-link hash |
 | `src/saliency.ts` | the reverse pass for the saliency heatmap (gradient × input) |
 | `src/image.ts` | turning an image input tensor back into pixels (range, gray / RGB, frame stack) |
+| `src/legend.ts` | the "What am I looking at" key |
 | `src/compare.ts` | compare mode: two Renderers in panels, the agreement strip |
 | `src/export.ts` | GIF (gifenc) and WebCodecs video (mediabunny) |
 | `src/io/npy.ts` | `.npy` / `.npz` (zip + DecompressionStream) / JSON readers |
@@ -305,6 +321,7 @@ node test/smoke.mjs mlp        # also: cnn, rgbf, mixed, resmlp, rescnn, gated (
 node test/recurrent.mjs        # LSTM / GRU: state threaded and reset, loop edges exact, cell recomputation, demo
 node test/saliency.mjs         # heatmap vs finite differences, overlay, opacity, in the export
 node test/compare.mjs          # compare: demo, agreement strip, side by side / stacked, phone, exports with both
+node test/polish.mjs           # first-visit legend, free height at extreme sizes, ?embed=1, embed code, player page
 node test/residual.mjs         # skips: exact split at the Add, arcs over the block, no overlaps, rejection of gating
 node test/mixed.mjs            # two-input demo: match, lanes, edges from both branches, drag, short GIF
 node test/panel.mjs            # extreme sizes: no picture, label, title or column overlaps another

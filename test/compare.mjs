@@ -7,6 +7,8 @@ import { writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 const url = process.env.URL ?? "http://localhost:5181/?demo=none";
 const b = await chromium.launch();
+// the first-visit legend is tested in polish.mjs; keep it out of these screenshots
+const _np = b.newPage.bind(b); b.newPage = async (o) => { const pg = await _np(o); await pg.addInitScript(() => localStorage.setItem("netglow:legend-seen:v1", "1")); return pg; };
 const state = (p) => p.evaluate(() => {
   const S = window.netglow.S, R = S.renderer;
   const over = (B) => { const bad = []; for (let i = 0; i < B.length; i++) for (let j = i + 1; j < B.length; j++) { const a = B[i], c = B[j]; if (a.x0 < c.x1 - 0.5 && c.x0 < a.x1 - 0.5 && a.y0 < c.y1 - 0.5 && c.y0 < a.y1 - 0.5) bad.push(`${a.kind} / ${c.kind}`); } return bad; };

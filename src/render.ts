@@ -402,16 +402,18 @@ export class Renderer {
         band[ci] = c.lane < 0 ? [top, bot] : laneBand[c.lane];
         P[ci] = (band[ci][1] - band[ci][0]) / Math.max(1, c.sel.length);
       });
-      const pitch = Math.min(46 * u, ...P);
+      // row pitch caps use the unshrunk unit: when the width forced a shrink, the rows still spread over the
+      // height that is free, instead of the whole picture shrinking into the middle
+      const pitch = Math.min(46 * s, ...P);
       cols.forEach((c, ci) => {
         // each column spreads over its own band; lanes of a multi-input model each have their own pitch
-        const own = Math.min(46 * u, P[ci]);
-        const want = c.kind === "hidden" ? own * st.rowSpacing : Math.min(own * 1.25, 56 * u) * st.rowSpacing;
+        const own = Math.min(46 * s, P[ci]);
+        const want = c.kind === "hidden" ? own * st.rowSpacing : Math.min(own * 1.25, 56 * s) * st.rowSpacing;
         p[ci] = Math.min(want, P[ci]);
       });
       // node and tile sizes never exceed the row pitch they sit in
       const minP = (pred: (c: VizColumn) => boolean) => Math.min(Infinity, ...cols.filter((c) => pred(c) && c.sel.length > 1).map((c) => p[cols.indexOf(c)]));
-      this.r = Math.min(Math.max(3, Math.min(11 * u, pitch * 0.3)) * st.nodeScale, 0.46 * minP((c) => !c.image && !isMap(c)));
+      this.r = Math.min(Math.max(3, Math.min(11 * s * Math.sqrt(f), pitch * 0.3)) * st.nodeScale, 0.46 * minP((c) => !c.image && !isMap(c)));
       this.mapSize = Math.min(Math.max(6, Math.min(pitch * 0.78, 38 * u)) * st.mapScale, 0.9 * minP(isMap) - 4 * u);
       this.mapSize = Math.max(4, this.mapSize);
     };

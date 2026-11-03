@@ -1,6 +1,8 @@
 // Screenshot of the settings panel with every group open, and a customised CNN look.
 import { chromium } from "@playwright/test";
 const b = await chromium.launch();
+// the first-visit legend is tested in polish.mjs; keep it out of these screenshots
+const _np = b.newPage.bind(b); b.newPage = async (o) => { const pg = await _np(o); await pg.addInitScript(() => localStorage.setItem("netglow:legend-seen:v1", "1")); return pg; };
 const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
 await p.goto("http://localhost:5181/?demo=lunar-cnn&paused");
 await p.waitForFunction(() => window.netglow?.S?.viz);
