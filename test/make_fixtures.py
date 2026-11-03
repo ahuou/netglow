@@ -43,3 +43,17 @@ imgs = (imgs * 0.5 + 0.5 - 0.45) / 0.22
 with torch.no_grad(): lg3 = rgb(torch.from_numpy(imgs)).numpy()
 torch.onnx.export(rgb, torch.zeros(1, 3, 32, 32), f"{out}/rgbf.onnx", input_names=["obs"], output_names=["logits"], dynamic_axes={"obs": {0: "batch"}, "logits": {0: "batch"}}, opset_version=17, dynamo=False)
 np.savez_compressed(f"{out}/rgbf.npz", obs=imgs, actions=lg3.argmax(1).astype(np.int64), outputs=lg3, fps=np.float64(10))
+
+# two inputs joined by a Concat: uint8 frames through a conv stack + a float vector straight in, then a dense head
+class Mixed(nn.Module):
+    def __init__(s):
+        super().__init__()
+        s.c = nn.Sequential(nn.Conv2d(2, 16, 8, 4), nn.ReLU(), nn.Conv2d(16, 32, 4, 2), nn.ReLU(), nn.Flatten())
+        s.h = nn.Sequential(nn.Linear(32 * 36 + 6, 128), nn.ReLU(), nn.Linear(128, 4))
+    def forward(s, frames, vector): return s.h(torch.cat([s.c(frames.float() / 255.0), vector], 1))
+mixed = Mixed()
+fr = (np.random.rand(40, 2, 64, 64) * 255).astype(np.uint8)
+vec = np.cumsum(np.random.randn(40, 6).astype(np.float32) * 0.1, 0)
+with torch.no_grad(): lg4 = mixed(torch.from_numpy(fr), torch.from_numpy(vec)).numpy()
+torch.onnx.export(mixed, (torch.zeros(1, 2, 64, 64, dtype=torch.uint8), torch.zeros(1, 6)), f"{out}/mixed.onnx", input_names=["frames", "vector"], output_names=["logits"], dynamic_axes={"frames": {0: "batch"}, "vector": {0: "batch"}, "logits": {0: "batch"}}, opset_version=17, dynamo=False)
+np.savez_compressed(f"{out}/mixed.npz", obs_frames=fr, obs_vector=vec, actions=lg4.argmax(1).astype(np.int64), outputs=lg4, fps=np.float64(20))

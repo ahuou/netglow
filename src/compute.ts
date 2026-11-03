@@ -8,7 +8,12 @@
 //                             conv:   contribution of input channel c to the spatial MEAN of output channel d's
 //                                     pre-activation = sum_k W[d,c,k] * mean of x_t[c] over the positions kernel tap k reads
 //                                     (exact for the channel mean; bias excluded)
-//   column      - one vertical row of nodes: the input, each hidden layer, the output
+//                             dense after a Concat: the same, on the slice of the weight columns that belongs to each branch
+//                             (W[j, off_b + i] * x_t[off_b + i], so every branch keeps its exact share)
+//   column      - one vertical row of nodes: an input, each hidden layer, the output
+//   lane        - with several model inputs, each branch (input + its own layers) gets a horizontal band of the
+//                 canvas; columns after the Concat span the full height (lane -1)
+//   stage       - a column's horizontal position, 0 = inputs; branch columns line up stage by stage
 //   selection   - the units shown: output-driving units first, then backwards layer by layer
 //   robust norm - map values to 0..1 using the 5th and 95th percentile over the whole recording, so one spike
 //                 does not wash out the rest and flicker reflects real change
@@ -35,6 +40,14 @@ export interface VizColumn {
   /** conv columns: real activation maps of the selected channels, per tick, each channel scaled 0..255
    *  over the whole recording (1st..99th percentile). Layout: T x sel.length x H x W */
   maps?: { H: number; W: number; data: Uint8Array };
+  /** vertical band: branch index, or -1 = full height (columns after the merge, and every column of a chain model) */
+  lane: number;
+  /** horizontal position, 0 = inputs */
+  stage: number;
+  /** input columns: which model input (index into plan.inputs), where its names start in labels.inputs, image or not */
+  input?: number;
+  base?: number;
+  image?: boolean;
 }
 
 export interface VizEdges {
@@ -61,6 +74,9 @@ export interface Viz {
   mode: OutputMode;
   match: MatchCheck;
   imageInput: { C: number; H: number; W: number } | null;
+  /** number of lanes (1 for chain models) and stages */
+  lanes: number;
+  stages: number;
 }
 
 export interface VizOptions {
@@ -80,6 +96,16 @@ export function percentile(a: ArrayLike<number>, q: number): number {
   const lo = Math.floor(p);
   const hi = Math.min(s.length - 1, lo + 1);
   return s[lo] + (s[hi] - s[lo]) * (p - lo);
+}
+
+/** a per-tick tensor, or a slice of one: element i of tick t is data[t * stride + off + i] (stride defaults to size).
+ *  A slice is how one branch's share of a Concat output is read; dims give its shape for grouping by channel. */
+interface TView {
+  dims: number[];
+  size: number;
+  data: Float32Array;
+  stride?: number;
+  off?: number;
 }
 
 /** per-tick unit values of a tensor: dense = |a|, conv map = |spatial mean| per channel */
@@ -131,7 +157,7 @@ function tapMeans(layer: Layer, src: { dims: number[]; size: number; data: Float
 }
 
 /** contributions of every source group to the given targets: T x targets.length x G */
-function contributions(layer: Layer, src: { dims: number[]; size: number; data: Float32Array }, T: number, targets: number[], cache: Map<Layer, Float32Array>): { c: Float32Array; G: number } {
+function contributions(layer: Layer, src: TView, T: number, targets: number[], cache: Map<Layer, Float32Array>): { c: Float32Array; G: number } {
   const nt = targets.length;
   if (layer.kind === "conv") {
     const C = src.dims[0];
@@ -154,14 +180,18 @@ function contributions(layer: Layer, src: { dims: number[]; size: number; data: 
     return { c: out, G: C };
   }
   const Sz = src.size;
-  if (Sz !== layer.in) throw new Error(`Dense layer "${layer.node.name}" expects ${layer.in} inputs, its source has ${Sz}.`);
+  const off = src.off ?? 0;
+  const stride = src.stride ?? Sz;
+  if (off + Sz > layer.in || (stride === Sz && Sz !== layer.in))
+    throw new Error(`Dense layer "${layer.node.name}" expects ${layer.in} inputs, its source has ${Sz}.`);
   const G = src.dims.length === 3 ? src.dims[0] : Sz;
   const gs = Sz / G;
   const out = new Float32Array(T * nt * G);
   for (let t = 0; t < T; t++) {
-    const xo = t * Sz;
+    const xo = t * stride + off;
     for (let jj = 0; jj < nt; jj++) {
-      const wo = targets[jj] * Sz;
+      // the weight columns of this source: a branch's slice of the Concat, or all of them
+      const wo = targets[jj] * layer.in + off;
       const oo = (t * nt + jj) * G;
       if (gs === 1) for (let i = 0; i < Sz; i++) out[oo + i] = layer.W[wo + i] * src.data[xo + i];
       else
@@ -191,22 +221,75 @@ function softmaxRows(x: Float32Array, T: number, n: number): Float32Array {
   return p;
 }
 
-export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, obs: NdArray, opt: VizOptions, prevOrder?: { input?: number[]; output?: number[] }): Viz {
+/** obs: one recording array per model input, in plan.inputs order */
+export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, obs: NdArray[], opt: VizOptions, prevOrder?: { inputs?: number[][]; output?: number[] }): Viz {
   const T = trace.T;
-  const L = plan.layers;
   const get = (name: string) => {
     const e = trace.tensors.get(name);
     if (!e) throw new Error(`missing tensor ${name}`);
     return e;
   };
-  // sources per layer k: column k values. column 0 = the tensor that feeds layer 0.
-  const obsF = toFloat(obs);
-  const obsDims = obs.shape.slice(1);
-  const in0 = trace.tensors.get(L[0].inTensor) ?? { dims: obsDims, size: obsDims.reduce((a, b) => a * b, 1), data: obsF };
-  const srcOf = (k: number) => (k === 0 ? in0 : get(L[k - 1].actTensor));
+  const obsF = obs.map(toFloat);
+  const inView = (i: number): TView => {
+    const dims = obs[i].shape.slice(1);
+    return { dims, size: dims.reduce((a, b) => a * b, 1), data: obsF[i] };
+  };
   const cache = new Map<Layer, Float32Array>();
+  const multi = !!plan.merge;
 
-  // output column
+  // ---- columns and what feeds them: branches (input + own layers), then the trunk after the merge
+  type Src = { ci: number; view: TView };
+  const cols: VizColumn[] = [];
+  const feeds: { ci: number; layer: Layer; srcs: Src[] }[] = [];
+  const blank = (kind: VizColumn["kind"], label: string, lane: number, stage: number): VizColumn => ({ kind, label, lane, stage, n: 0, sel: [], order: [], v: new Float32Array(0) });
+  const nbMax = Math.max(...plan.branches.map((b) => b.layers.length));
+  const branchEnd: { ci: number; view: TView }[] = [];
+  // where each input's names start in labels.inputs: model input order, an image input takes one name
+  const baseOf: number[] = [];
+  plan.inputs.reduce((acc, inp, i) => ((baseOf[i] = acc), acc + (inp.isImage ? 1 : inView(i).size)), 0);
+  plan.branches.forEach((b, bi) => {
+    const lane = multi ? bi : -1;
+    const inp = plan.inputs[b.input];
+    const col = blank("input", "input", lane, 0);
+    col.input = b.input;
+    col.base = baseOf[b.input];
+    col.image = inp.isImage;
+    cols.push(col);
+    let prev = cols.length - 1;
+    b.layers.forEach((l, li) => {
+      const view = li === 0 ? (trace.tensors.get(l.inTensor) ?? inView(b.input)) : get(b.layers[li - 1].actTensor);
+      cols.push(blank("hidden", l.label, lane, li + 1));
+      feeds.push({ ci: cols.length - 1, layer: l, srcs: [{ ci: prev, view }] });
+      prev = cols.length - 1;
+    });
+    branchEnd.push({ ci: prev, view: b.layers.length ? get(b.layers[b.layers.length - 1].actTensor) : inView(b.input) });
+  });
+  plan.trunk.forEach((l, li) => {
+    const isOut = li === plan.trunk.length - 1;
+    cols.push(blank(isOut ? "output" : "hidden", isOut ? "output" : l.label, -1, nbMax + 1 + li));
+    const ci = cols.length - 1;
+    if (li > 0) feeds.push({ ci, layer: l, srcs: [{ ci: ci - 1, view: get(plan.trunk[li - 1].actTensor) }] });
+    else if (!multi) feeds.push({ ci, layer: l, srcs: [{ ci: branchEnd[0].ci, view: trace.tensors.get(l.inTensor) ?? branchEnd[0].view }] });
+    else {
+      // the dense layer after the Concat: read each branch's slice of its real input, in Concat order
+      const x = get(l.inTensor);
+      if (x.size !== l.in) throw new Error(`Dense layer "${l.node.name}" expects ${l.in} inputs, the Concat gives ${x.size}.`);
+      let off = 0;
+      const srcs: Src[] = plan.branches.map((b, bi) => {
+        const e = branchEnd[bi];
+        const sz = b.concatIn && trace.tensors.has(b.concatIn) ? get(b.concatIn).size : e.view.size;
+        if (sz !== e.view.size) throw new Error(`Branch of input "${plan.inputs[b.input].name}" hands ${sz} values to the Concat, but its last layer has ${e.view.size}.`);
+        const src = { ci: e.ci, view: { dims: e.view.dims, size: sz, data: x.data, stride: x.size, off } };
+        off += sz;
+        return src;
+      });
+      if (off !== l.in) throw new Error(`The Concat branches add up to ${off} values; "${l.node.name}" expects ${l.in}.`);
+      feeds.push({ ci, layer: l, srcs });
+    }
+  });
+  const outCi = cols.length - 1;
+
+  // ---- output column values
   const logits = get(plan.outputTensor);
   const nOut = logits.size;
   const mode = opt.mode;
@@ -234,129 +317,131 @@ export function buildViz(plan: Plan, trace: Trace, rec: Map<string, NdArray>, ob
   for (let t = 0; t < T; t++) for (let i = 0; i < nOut; i++) outMean[i] += prob[t * nOut + i];
   const outSel = nOut <= 16 ? [...Array(nOut).keys()] : topIdx(outMean, 16).sort((a, b) => a - b);
 
-  // backwards selection
-  const sels: number[][] = new Array(L.length + 1);
-  sels[L.length] = outSel;
-  const edgeRaw: { c: Float32Array; G: number; from: number }[] = new Array(L.length);
-  const meanAbs: Float64Array[] = new Array(L.length);
-  for (let k = L.length - 1; k >= 0; k--) {
-    const targets = sels[k + 1];
-    const { c, G } = contributions(L[k], srcOf(k), T, targets, cache);
-    const score = new Float64Array(G);
-    for (let t = 0; t < T; t++) for (let jj = 0; jj < targets.length; jj++) for (let g = 0; g < G; g++) score[g] += Math.abs(c[(t * targets.length + jj) * G + g]);
-    const isImageSrc = k === 0 && obsDims.length === 3;
-    // an image input is one node: every channel of the stack is kept, then summed into one edge per target
-    const cap = isImageSrc ? G : k === 0 ? (G <= opt.maxInputs ? G : opt.nodesPerColumn) : opt.nodesPerColumn;
-    let sel = topIdx(score, cap);
-    if (k === 0) sel = sel.sort((a, b) => a - b);
-    sels[k] = sel;
-    // restrict to selected sources
+  // ---- backwards selection: consumers come after their sources in `cols`, so walk the feeds in reverse
+  const sels: number[][] = cols.map(() => []);
+  sels[outCi] = outSel;
+  const edgeRaw: { from: number; to: number; c: Float32Array; meanAbs: Float64Array }[] = [];
+  for (let f = feeds.length - 1; f >= 0; f--) {
+    const { ci, layer, srcs } = feeds[f];
+    const targets = sels[ci];
     const nt = targets.length;
+    for (const src of srcs) {
+      const sc = cols[src.ci];
+      const { c, G } = contributions(layer, src.view, T, targets, cache);
+      const score = new Float64Array(G);
+      for (let t = 0; t < T; t++) for (let jj = 0; jj < nt; jj++) for (let g = 0; g < G; g++) score[g] += Math.abs(c[(t * nt + jj) * G + g]);
+      const isImageSrc = sc.kind === "input" && !!sc.image;
+      // an image input is one node: every channel of the stack is kept, then summed into one edge per target
+      const cap = isImageSrc ? G : sc.kind === "input" ? (G <= opt.maxInputs ? G : opt.nodesPerColumn) : opt.nodesPerColumn;
+      let sel = topIdx(score, cap);
+      if (sc.kind === "input") sel = sel.sort((a, b) => a - b);
+      const ns = sel.length;
+      const r = new Float32Array(T * nt * ns);
+      const ma = new Float64Array(nt * ns);
+      for (let t = 0; t < T; t++)
+        for (let jj = 0; jj < nt; jj++)
+          for (let ii = 0; ii < ns; ii++) {
+            const v = c[(t * nt + jj) * G + sel[ii]];
+            r[(t * nt + jj) * ns + ii] = v;
+            ma[jj * ns + ii] += Math.abs(v) / T;
+          }
+      if (isImageSrc) {
+        const r1 = new Float32Array(T * nt);
+        const m1 = new Float64Array(nt);
+        for (let q = 0; q < T * nt; q++) {
+          let sum = 0;
+          for (let ii = 0; ii < ns; ii++) sum += r[q * ns + ii];
+          r1[q] = sum;
+          m1[q % nt] += Math.abs(sum) / T;
+        }
+        sels[src.ci] = [0];
+        edgeRaw.push({ from: src.ci, to: ci, c: r1, meanAbs: m1 });
+        continue;
+      }
+      sels[src.ci] = sel;
+      edgeRaw.push({ from: src.ci, to: ci, c: r, meanAbs: ma });
+    }
+  }
+
+  // ---- column values
+  let inputNo = 0;
+  let imageInput: Viz["imageInput"] = null;
+  for (let ci = 0; ci < cols.length; ci++) {
+    const col = cols[ci];
+    const sel = sels[ci];
     const ns = sel.length;
-    const r = new Float32Array(T * nt * ns);
-    const ma = new Float64Array(nt * ns);
-    for (let t = 0; t < T; t++)
-      for (let jj = 0; jj < nt; jj++)
+    col.sel = sel;
+    if (col.kind === "input") {
+      const x = obsF[col.input!];
+      const dims = obs[col.input!].shape.slice(1);
+      const size = dims.reduce((a, b) => a * b, 1);
+      if (col.image) {
+        // image node: brightness = how much the whole input image changed since the last tick
+        imageInput = { C: dims[0], H: dims[1], W: dims[2] };
+        const chg = new Float32Array(T);
+        for (let t = 1; t < T; t++) {
+          let d = 0;
+          for (let p = 0; p < size; p++) d += Math.abs(x[t * size + p] - x[(t - 1) * size + p]);
+          chg[t] = d / size;
+        }
+        const sc = Math.max(percentile(chg, 95), 1e-9);
+        Object.assign(col, { n: 1, sel: [0], order: [0], v: chg.map((q) => Math.min(1, q / sc)) });
+      } else {
+        // brightness = how fast each input changes, scaled per input over the recording
+        const raw = new Float32Array(T * ns);
+        const chg = new Float32Array(T * ns);
+        for (let t = 0; t < T; t++)
+          for (let ii = 0; ii < ns; ii++) {
+            const g = sel[ii];
+            raw[t * ns + ii] = x[t * size + g];
+            chg[t * ns + ii] = t > 0 ? Math.abs(x[t * size + g] - x[(t - 1) * size + g]) : 0;
+          }
+        const v = new Float32Array(T * ns);
         for (let ii = 0; ii < ns; ii++) {
-          const v = c[(t * nt + jj) * G + sel[ii]];
-          r[(t * nt + jj) * ns + ii] = v;
-          ma[jj * ns + ii] += Math.abs(v) / T;
+          const cc = new Float32Array(T);
+          for (let t = 0; t < T; t++) cc[t] = chg[t * ns + ii];
+          const sc = Math.max(percentile(cc, 95), 1e-9);
+          for (let t = 0; t < T; t++) v[t * ns + ii] = Math.min(1, chg[t * ns + ii] / sc);
         }
-    if (isImageSrc) {
-      const r1 = new Float32Array(T * nt);
-      const m1 = new Float64Array(nt);
-      for (let q = 0; q < T * nt; q++) {
-        let sum = 0;
-        for (let ii = 0; ii < ns; ii++) sum += r[q * ns + ii];
-        r1[q] = sum;
-        m1[q % nt] += Math.abs(sum) / T;
+        const prev = prevOrder?.inputs?.[inputNo];
+        Object.assign(col, { n: size, order: prev && prev.length === ns ? prev : [...Array(ns).keys()], v, raw });
       }
-      sels[0] = [0];
-      edgeRaw[k] = { c: r1, G, from: k };
-      meanAbs[k] = m1;
-      continue;
+      inputNo++;
+    } else if (col.kind === "hidden") {
+      const l = feeds.find((f) => f.ci === ci)!.layer;
+      const act = get(l.actTensor);
+      const u = unitValues(act, T);
+      const vals = new Float32Array(T * ns);
+      for (let t = 0; t < T; t++) for (let ii = 0; ii < ns; ii++) vals[t * ns + ii] = u.vals[t * u.n + sel[ii]];
+      const lo = percentile(vals, 5);
+      const hi = percentile(vals, 95);
+      const v = vals.map((x) => Math.min(1, Math.max(0, (x - lo) / Math.max(hi - lo, 1e-9))));
+      Object.assign(col, { label: `${l.label} · ${u.n}`, n: u.n, order: [...Array(ns).keys()], v, maps: act.dims.length === 3 ? featureMaps(act, sel, T) : undefined });
+    } else {
+      const v = new Float32Array(T * ns);
+      for (let t = 0; t < T; t++) for (let ii = 0; ii < ns; ii++) v[t * ns + ii] = prob[t * nOut + outSel[ii]];
+      const order = prevOrder?.output && prevOrder.output.length === ns ? prevOrder.output : [...Array(ns).keys()];
+      Object.assign(col, { n: nOut, order, v, raw: v });
     }
-    edgeRaw[k] = { c: r, G, from: k };
-    meanAbs[k] = ma;
   }
 
-  // columns
-  const cols: VizColumn[] = [];
-  // input column: brightness = how fast each input changes, scaled per input over the recording
-  if (obsDims.length === 3) {
-    // image node: brightness = how much the whole input image changed since the last tick
-    const size = obsDims[0] * obsDims[1] * obsDims[2];
-    const chg = new Float32Array(T);
-    for (let t = 1; t < T; t++) {
-      let d = 0;
-      for (let p = 0; p < size; p++) d += Math.abs(obsF[t * size + p] - obsF[(t - 1) * size + p]);
-      chg[t] = d / size;
-    }
-    const sc = Math.max(percentile(chg, 95), 1e-9);
-    cols.push({ kind: "input", label: "input", n: 1, sel: [0], order: [0], v: chg.map((x) => Math.min(1, x / sc)) });
-  } else {
-    const sel = sels[0];
-    const ns = sel.length;
-    const isImg = false;
-    const C = isImg ? obsDims[0] : obsDims.reduce((a, b) => a * b, 1);
-    const per = isImg ? obsDims[1] * obsDims[2] : 1;
-    const size = C * per;
-    const raw = new Float32Array(T * ns);
-    const chg = new Float32Array(T * ns);
-    for (let t = 0; t < T; t++)
-      for (let ii = 0; ii < ns; ii++) {
-        const g = sel[ii];
-        let m = 0;
-        let d = 0;
-        for (let p = 0; p < per; p++) {
-          const x = obsF[t * size + g * per + p];
-          m += x;
-          if (t > 0) d += Math.abs(x - obsF[(t - 1) * size + g * per + p]);
-        }
-        raw[t * ns + ii] = m / per;
-        chg[t * ns + ii] = d / per;
-      }
-    const v = new Float32Array(T * ns);
-    for (let ii = 0; ii < ns; ii++) {
-      const col = new Float32Array(T);
-      for (let t = 0; t < T; t++) col[t] = chg[t * ns + ii];
-      const sc = Math.max(percentile(col, 95), 1e-9);
-      for (let t = 0; t < T; t++) v[t * ns + ii] = Math.min(1, chg[t * ns + ii] / sc);
-    }
-    const order = prevOrder?.input && prevOrder.input.length === ns ? prevOrder.input : [...Array(ns).keys()];
-    cols.push({ kind: "input", label: "input", n: isImg ? C : C, sel, order, v, raw });
+  // edges into the same column share one scale, so a Concat's branches are drawn on a common footing
+  const scaleTo = new Map<number, number>();
+  for (const to of new Set(edgeRaw.map((e) => e.to))) {
+    const all = edgeRaw.filter((e) => e.to === to).flatMap((e) => Array.from(e.c, Math.abs));
+    scaleTo.set(to, Math.max(percentile(all, 95), 1e-9));
   }
-  for (let k = 0; k + 1 < L.length; k++) {
-    const sel = sels[k + 1];
-    const u = unitValues(get(L[k].actTensor), T);
-    const ns = sel.length;
-    const vals = new Float32Array(T * ns);
-    for (let t = 0; t < T; t++) for (let ii = 0; ii < ns; ii++) vals[t * ns + ii] = u.vals[t * u.n + sel[ii]];
-    const lo = percentile(vals, 5);
-    const hi = percentile(vals, 95);
-    const v = vals.map((x) => Math.min(1, Math.max(0, (x - lo) / Math.max(hi - lo, 1e-9))));
-    const act = get(L[k].actTensor);
-    cols.push({ kind: "hidden", label: `${L[k].label} · ${u.n}`, n: u.n, sel, order: [...Array(ns).keys()], v, maps: act.dims.length === 3 ? featureMaps(act, sel, T) : undefined });
-  }
-  {
-    const ns = outSel.length;
-    const v = new Float32Array(T * ns);
-    for (let t = 0; t < T; t++) for (let ii = 0; ii < ns; ii++) v[t * ns + ii] = prob[t * nOut + outSel[ii]];
-    const order = prevOrder?.output && prevOrder.output.length === ns ? prevOrder.output : [...Array(ns).keys()];
-    cols.push({ kind: "output", label: "output", n: nOut, sel: outSel, order, v, raw: v });
-  }
-
-  const edges: VizEdges[] = edgeRaw.map((e, k) => {
-    const abs = e.c.map(Math.abs);
-    return { from: k, to: k + 1, c: e.c, scale: Math.max(percentile(abs, 95), 1e-9) };
-  });
+  edgeRaw.sort((a, b) => a.to - b.to || a.from - b.from);
+  const edges: VizEdges[] = edgeRaw.map((e) => ({ from: e.from, to: e.to, c: e.c, scale: scaleTo.get(e.to)! }));
 
   const viz: Viz = {
     T, cols, edges, chosen, mode,
     match: matchCheck(plan, trace, rec, chosen, mode),
-    imageInput: obsDims.length === 3 ? { C: obsDims[0], H: obsDims[1], W: obsDims[2] } : null,
+    imageInput,
+    lanes: multi ? plan.branches.length : 1,
+    stages: nbMax + 1 + plan.trunk.length,
   };
-  (viz as VizInternal)._meanAbs = meanAbs;
+  (viz as VizInternal)._meanAbs = edgeRaw.map((e) => e.meanAbs);
   orderHidden(viz);
   return viz;
 }
@@ -385,11 +470,14 @@ interface VizInternal extends Viz {
 
 /** Barycentric ordering of hidden columns, right to left: each unit sits near the targets it drives most. */
 export function orderHidden(viz: Viz) {
-  const meanAbs = (viz as VizInternal)._meanAbs;
-  for (let ci = viz.cols.length - 2; ci >= 1; ci--) {
+  const meanAbs = (viz as VizInternal)._meanAbs; // aligned with viz.edges
+  for (let ci = viz.cols.length - 2; ci >= 0; ci--) {
     const col = viz.cols[ci];
-    const next = viz.cols[ci + 1];
-    const ma = meanAbs[ci]; // edges ci -> ci+1: (next.sel x col.sel)
+    if (col.kind !== "hidden") continue;
+    const ei = viz.edges.findIndex((e) => e.from === ci);
+    if (ei < 0) continue;
+    const next = viz.cols[viz.edges[ei].to];
+    const ma = meanAbs[ei]; // edges ci -> next: (next.sel x col.sel)
     const slotOf = new Float64Array(next.sel.length);
     next.order.forEach((ii, slot) => (slotOf[ii] = slot / Math.max(1, next.order.length - 1)));
     const ns = col.sel.length;

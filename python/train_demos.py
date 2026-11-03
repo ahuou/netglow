@@ -5,6 +5,8 @@
     python train_demos.py mlp            # export demo A              -> public/demos/lunar-mlp/
     python train_demos.py cnn            # BC + DAgger pixel pilot    -> runs/cnn_pilot.pt
     python train_demos.py cnn-export     # export demo B              -> public/demos/lunar-cnn/
+    python train_demos.py mixed          # BC + DAgger pixels+numbers -> runs/mixed_pilot.pt
+    python train_demos.py mixed-export   # export demo C              -> public/demos/lunar-mixed/
 
 Demo A: Stable-Baselines3 PPO on the 8-number LunarLander-v3 state.
 Demo B: a small CNN that flies from pixels only, taught by imitating demo A
@@ -16,6 +18,8 @@ Vocabulary
 ----------
 expert       the PPO policy from demo A; it sees the true state.
 student      the CNN; it sees only two stacked 64x64 grayscale frames.
+             Demo C's student sees the same frames plus 6 plain numbers
+             (x/y speed, angle, spin, leg contacts), one ONNX input each.
 frame stack  the last 2 frames as 2 channels, so motion (velocity) is visible.
 """
 
@@ -101,7 +105,7 @@ def pick_episode(env, policy_fn, render: bool, seeds, lo=200, hi=500):
         rec = record_episode(env, policy_fn, seed=int(s), max_steps=600, render=False)
         rec["landed"] = rec["terminated"] and landed(env)
         rec["seed"] = int(s)
-        T = len(rec["obs"])
+        T = n_obs(rec["obs"])
         score = rec["episode_return"] + (1000 if rec["landed"] and lo <= T <= hi else 0)
         log(f"  seed {s}: T={T} return={rec['episode_return']:.1f} landed={rec['landed']}")
         if best is None or score > best[0]:
@@ -111,7 +115,8 @@ def pick_episode(env, policy_fn, render: bool, seeds, lo=200, hi=500):
     rec = best[1]
     if render:  # deterministic env + policy: replaying the seed reproduces it, now with frames
         again = record_episode(env, policy_fn, seed=rec["seed"], max_steps=600, render=True)
-        assert len(again["obs"]) == len(rec["obs"]) and np.allclose(again["obs"], rec["obs"])
+        a, b = (again["obs"], rec["obs"]) if isinstance(rec["obs"], tuple) else ((again["obs"],), (rec["obs"],))
+        assert len(a[0]) == len(b[0]) and all(np.allclose(x, y) for x, y in zip(a, b))
         again.update(landed=rec["landed"], seed=rec["seed"])
         rec = again
     return rec
@@ -245,17 +250,30 @@ def collect(env, expert, student=None, episodes=30, seed0=0, beta=1.0, max_steps
             if te or tr:
                 break
         rets.append(total)
-    return np.stack(X), np.stack(L).astype(np.float32), rets
+    return stack_obs(X), np.stack(L).astype(np.float32), rets
+
+
+def stack_obs(xs):
+    """list of per-tick obs -> one array, or a tuple of arrays when each obs is a tuple (several inputs)"""
+    if isinstance(xs[0], tuple):
+        return tuple(np.stack([x[i] for x in xs]) for i in range(len(xs[0])))
+    return np.stack(xs)
+
+
+def cat_obs(a, b):
+    return tuple(np.concatenate([x, y]) for x, y in zip(a, b)) if isinstance(a, tuple) else np.concatenate([a, b])
 
 
 def fit(net, X, L, device, epochs=30, bs=256, lr=1e-3):
     """Distil the expert: cross-entropy against softmax(expert logits) (soft labels
     carry how sure the expert was, which helps where it dithers between actions).
     Returns (train, held-out) accuracy of argmax vs the expert's argmax."""
-    n = len(X)
+    Xs = X if isinstance(X, tuple) else (X,)
+    n = len(Xs[0])
     idx = np.random.default_rng(0).permutation(n)
     va, tr = idx[: n // 10], idx[n // 10:]
-    Xt = torch.as_tensor(X).to(device)
+    Xts = [torch.as_tensor(x).to(device) for x in Xs]
+    fwd = lambda b: net(*[x[b] for x in Xts])
     Pt = torch.softmax(torch.as_tensor(L), -1).to(device)
     Yt = Pt.argmax(-1)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -265,7 +283,7 @@ def fit(net, X, L, device, epochs=30, bs=256, lr=1e-3):
         perm = torch.as_tensor(np.random.permutation(tr)).to(device)
         for i in range(0, len(perm), bs):
             b = perm[i:i + bs]
-            loss = -(Pt[b] * torch.log_softmax(net(Xt[b]), -1)).sum(-1).mean()
+            loss = -(Pt[b] * torch.log_softmax(fwd(b), -1)).sum(-1).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -274,14 +292,19 @@ def fit(net, X, L, device, epochs=30, bs=256, lr=1e-3):
     with torch.no_grad():
         def acc(ix):
             ix = torch.as_tensor(ix[:20000]).to(device)
-            return (net(Xt[ix]).argmax(-1) == Yt[ix]).float().mean().item()
+            return (fwd(ix).argmax(-1) == Yt[ix]).float().mean().item()
         return acc(tr), acc(va)
+
+
+def n_obs(X):
+    return len(X[0]) if isinstance(X, tuple) else len(X)
 
 
 def make_student_fn(net, device):
     def act(obs):
         with torch.no_grad():
-            logits = net(torch.as_tensor(obs[None]).to(device))[0].cpu().numpy()
+            xs = obs if isinstance(obs, tuple) else (obs,)
+            logits = net(*[torch.as_tensor(x[None]).to(device) for x in xs])[0].cpu().numpy()
         return int(logits.argmax()), logits
 
     return act
@@ -297,42 +320,47 @@ def evaluate(env, policy_fn, seeds):
 
 
 def train_cnn(bc_episodes: int, dagger_rounds: int, dagger_episodes: int, repeat: int, epochs: int) -> None:
+    train_student(CNNPilot, PixelObs, CNN_PATH, "cnn", bc_episodes, dagger_rounds, dagger_episodes, repeat, epochs)
+
+
+def train_student(Net, Wrapper, ckpt_path: str, tag: str, bc_episodes: int, dagger_rounds: int, dagger_episodes: int,
+                  repeat: int, epochs: int) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
     torch.set_num_threads(8)
     _, expert = load_expert()
-    env = PixelObs(gym.make(ENV_ID, render_mode="rgb_array"), repeat=repeat)
+    env = Wrapper(gym.make(ENV_ID, render_mode="rgb_array"), repeat=repeat)
     t0 = time.time()
     X, L, rets = collect(env, expert, episodes=bc_episodes, seed0=10_000)
-    log(f"[cnn] repeat={repeat}: {bc_episodes} expert episodes, {len(X)} frames, expert return {np.mean(rets):.1f} ({time.time() - t0:.0f}s)")
-    net = CNNPilot().to(device)
+    log(f"[{tag}] repeat={repeat}: {bc_episodes} expert episodes, {n_obs(X)} frames, expert return {np.mean(rets):.1f} ({time.time() - t0:.0f}s)")
+    net = Net().to(device)
     acc = fit(net, X, L, device, epochs)
     student = make_student_fn(net, device)
     stats = {"repeat": repeat, "rounds": []}
     eval_seeds = range(50_000, 50_020)
     ret, land = evaluate(env, student, eval_seeds)
-    log(f"[cnn] BC: train acc {acc[0]:.3f}, val acc {acc[1]:.3f}; closed loop return {ret:.1f}, landed {land:.0%}")
-    stats["rounds"].append({"round": 0, "frames": len(X), "train_acc": acc[0], "val_acc": acc[1], "return": ret, "landed": land})
+    log(f"[{tag}] BC: train acc {acc[0]:.3f}, val acc {acc[1]:.3f}; closed loop return {ret:.1f}, landed {land:.0%}")
+    stats["rounds"].append({"round": 0, "frames": n_obs(X), "train_acc": acc[0], "val_acc": acc[1], "return": ret, "landed": land})
     best = (ret, {k: v.detach().clone() for k, v in net.state_dict().items()})
     for r in range(1, dagger_rounds + 1):
         Xn, Ln, srets = collect(env, expert, student, episodes=dagger_episodes, seed0=20_000 + 1000 * r, beta=0.5 ** r)
-        X, L = np.concatenate([X, Xn]), np.concatenate([L, Ln])
-        net = CNNPilot().to(device)
+        X, L = cat_obs(X, Xn), np.concatenate([L, Ln])
+        net = Net().to(device)
         acc = fit(net, X, L, device, epochs)
         student = make_student_fn(net, device)
         ret, land = evaluate(env, student, eval_seeds)
-        log(f"[cnn] DAgger {r}: +{len(Xn)} frames (student return while collecting {np.mean(srets):.1f}); "
+        log(f"[{tag}] DAgger {r}: +{n_obs(Xn)} frames (student return while collecting {np.mean(srets):.1f}); "
             f"train acc {acc[0]:.3f}, val acc {acc[1]:.3f}; closed loop return {ret:.1f}, landed {land:.0%}")
-        stats["rounds"].append({"round": r, "frames": len(X), "train_acc": acc[0], "val_acc": acc[1], "return": ret, "landed": land})
+        stats["rounds"].append({"round": r, "frames": n_obs(X), "train_acc": acc[0], "val_acc": acc[1], "return": ret, "landed": land})
         if ret > best[0]:
             best = (ret, {k: v.detach().clone() for k, v in net.state_dict().items()})
     os.makedirs(RUNS, exist_ok=True)
-    torch.save({"state_dict": {k: v.cpu() for k, v in best[1].items()}, "repeat": repeat, "crop": CROP}, CNN_PATH)
+    torch.save({"state_dict": {k: v.cpu() for k, v in best[1].items()}, "repeat": repeat, "crop": CROP}, ckpt_path)
     stats["best_eval_return"] = best[0]
     stats["wall_s"] = time.time() - t0
-    with open(os.path.join(RUNS, "cnn_stats.json"), "w") as f:
+    with open(os.path.join(RUNS, f"{tag}_stats.json"), "w") as f:
         json.dump(stats, f, indent=2)
-    log(f"[cnn] kept best model (eval return {best[0]:.1f}); {time.time() - t0:.0f}s total")
+    log(f"[{tag}] kept best model (eval return {best[0]:.1f}); {time.time() - t0:.0f}s total")
 
 
 def export_cnn() -> None:
@@ -366,9 +394,91 @@ def export_cnn() -> None:
     log(f"[cnn-export] seed {rec['seed']}: T={len(obs)} return={rec['episode_return']:.1f} landed={rec['landed']} verify={v}")
 
 
+# ------------------------------------------------------- demo C: pixels + numbers
+
+
+VEC_IDX = [2, 3, 4, 5, 6, 7]  # state entries the mixed pilot also gets: x/y speed, angle, spin, leg contacts
+VEC_NAMES = ["x speed", "y speed", "angle", "spin", "left leg", "right leg"]
+MIXED_PATH = os.path.join(RUNS, "mixed_pilot.pt")
+
+
+class MixedObs(PixelObs):
+    """PixelObs plus a few plain numbers from the true state: obs = (frames (2, 64, 64) uint8, vector (6,) float32).
+    Position is left to the pixels; speed, tilt and contacts come as numbers."""
+
+    def _vec(self):
+        return np.asarray(self.state, dtype=np.float32)[VEC_IDX]
+
+    def reset(self, **kw):
+        frames, info = super().reset(**kw)
+        return (frames, self._vec()), info
+
+    def step(self, action):
+        frames, r, te, tr, info = super().step(action)
+        return (frames, self._vec()), r, te, tr, info
+
+
+class MixedPilot(nn.Module):
+    """Two ONNX inputs: frames uint8 (N, 2, 64, 64) and vector float32 (N, 6).
+    Conv branch on the frames, the vector passes straight through, both are concatenated into a dense head."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(2, 16, 8, stride=4), nn.ReLU(),   # -> 16 x 15 x 15
+            nn.Conv2d(16, 32, 4, stride=2), nn.ReLU(),  # -> 32 x 6 x 6
+            nn.Flatten(),
+        )
+        self.head = nn.Sequential(nn.Linear(32 * 6 * 6 + len(VEC_IDX), 128), nn.ReLU(), nn.Linear(128, 4))
+
+    def forward(self, frames: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+        return self.head(torch.cat([self.conv(frames.float() / 255.0), vector], dim=1))
+
+
+def train_mixed(bc_episodes: int, dagger_rounds: int, dagger_episodes: int, repeat: int, epochs: int) -> None:
+    train_student(MixedPilot, MixedObs, MIXED_PATH, "mixed", bc_episodes, dagger_rounds, dagger_episodes, repeat, epochs)
+
+
+def export_mixed() -> None:
+    out = os.path.join(DEMOS, "lunar-mixed")
+    net = MixedPilot()
+    ckpt = torch.load(MIXED_PATH)
+    net.load_state_dict(ckpt["state_dict"])
+    net.eval()
+    repeat = ckpt["repeat"]
+    act = make_student_fn(net, "cpu")
+    env = MixedObs(gym.make(ENV_ID, render_mode="rgb_array"), repeat=repeat)
+    seeds = range(100, 150)  # fresh seeds, not used in training or the training-time eval
+    ret, land = evaluate(env, act, seeds)
+    log(f"[mixed-export] closed loop on {len(seeds)} fresh seeds: return {ret:.1f}, landed {land:.0%}")
+    log("[mixed-export] picking an episode flown by the mixed pilot")
+    rec = pick_episode(env, act, render=True, seeds=range(60), lo=200 // repeat, hi=500 // repeat)
+    frames, vec = rec["obs"]
+    frames, vec = frames.astype(np.uint8), vec.astype(np.float32)
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, "model.onnx")
+    export_onnx(net, (torch.as_tensor(frames[:1]), torch.as_tensor(vec[:1])), path, input_name=["frames", "vector"])
+    v = verify_onnx(path, net, {"frames": frames, "vector": vec})
+    assert (rec["outputs"].argmax(-1) == rec["actions"]).all()
+    save_recording(os.path.join(out, "recording.npz"), {"frames": frames, "vector": vec}, rec["actions"], rec["outputs"],
+                   frames=rec["frames"], fps=FPS / repeat, output_names=OUTPUT_NAMES)
+    # with several model inputs, "inputs" names every input in model order; an image input takes one name
+    write_labels(os.path.join(out, "labels.json"), "LunarLander · pixels + numbers",
+                 ["camera"] + VEC_NAMES, OUTPUT_NAMES, icons=ICON_PATHS,
+                 description="Two inputs: the last two 64x64 grayscale frames (through a small conv stack) and 6 plain numbers "
+                             "(x/y speed, angle, spin, leg contacts), concatenated into a dense head. Decides every 4 physics "
+                             "ticks (12.5 Hz). Taught by imitating the PPO expert (behaviour cloning + DAgger).",
+                 input_units=[None, "", "", "rad", "", "0/1", "0/1"])
+    copy_icons(out)
+    with open(os.path.join(RUNS, "mixed_export.json"), "w") as f:
+        json.dump({"fresh_seeds": [seeds.start, seeds.stop], "return": ret, "landed": land, "episode_seed": rec["seed"],
+                   "episode_T": len(frames), "episode_return": rec["episode_return"], "episode_landed": rec["landed"]}, f, indent=2)
+    log(f"[mixed-export] seed {rec['seed']}: T={len(frames)} return={rec['episode_return']:.1f} landed={rec['landed']} verify={v}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["all", "ppo", "mlp", "cnn", "cnn-export"])
+    ap.add_argument("stage", choices=["all", "ppo", "mlp", "cnn", "cnn-export", "mixed", "mixed-export"])
     ap.add_argument("--timesteps", type=int, default=1_000_000)
     ap.add_argument("--bc-episodes", type=int, default=150)
     ap.add_argument("--dagger-rounds", type=int, default=5)
@@ -384,6 +494,10 @@ def main() -> None:
         train_cnn(args.bc_episodes, args.dagger_rounds, args.dagger_episodes, args.repeat, args.epochs)
     if args.stage in ("all", "cnn-export"):
         export_cnn()
+    if args.stage in ("all", "mixed"):
+        train_mixed(args.bc_episodes, args.dagger_rounds, args.dagger_episodes, args.repeat, args.epochs)
+    if args.stage in ("all", "mixed-export"):
+        export_mixed()
 
 
 if __name__ == "__main__":

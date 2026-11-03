@@ -1,11 +1,13 @@
-// Turns an ONNX graph into a "plan": the straight chain of weighted layers from the input to the output,
+// Turns an ONNX graph into a "plan": the weighted layers from the input(s) to the output,
 // which tensors to expose for each layer, and the weights needed for attribution.
 //
 // Vocabulary:
 //   weighted layer - a node that multiplies by learned weights: Gemm / MatMul (dense) or Conv
 //   activation     - the tensor a layer hands to the next weighted layer (after its bias, nonlinearity, pooling)
 //   data input     - the input of a node that carries the signal, as opposed to its constant weights / shape args
-//   chain          - v0 supports graphs where every node has exactly one data input (MLPs, CNN encoder + MLP head)
+//   chain          - a path where every node has exactly one data input (MLPs, CNN encoder + MLP head)
+//   branch / merge - several model inputs, each with its own chain (a conv stack, dense layers, or nothing),
+//                    joined by one Concat whose output runs through a trunk chain of dense layers to the outputs
 
 import { ELEM, type ModelInfo, type NodeProto, type TensorProto } from "./onnx/proto";
 
@@ -35,16 +37,38 @@ export interface Layer {
   label: string;
 }
 
+export interface PlanInput {
+  name: string;
+  elemType: number;
+  shape: (number | string)[];
+  /** [N, C, H, W] */
+  isImage: boolean;
+}
+
+/** the path from one model input to the merge (or, for chain models, the input alone) */
+export interface Branch {
+  /** index into plan.inputs */
+  input: number;
+  /** weighted layers between the input and the merge (empty when the input goes straight in) */
+  layers: Layer[];
+  /** the tensor this branch hands to the Concat (null for chain models) */
+  concatIn: string | null;
+}
+
 export interface Plan {
-  inputName: string;
-  inputElemType: number;
-  inputShape: (number | string)[];
-  layers: Layer[]; // the last one produces the outputs
+  inputs: PlanInput[];
+  /** one per model input, in Concat order (chain models: one branch with no layers) */
+  branches: Branch[];
+  /** the Concat that joins the branches; null for chain models */
+  merge: { node: NodeProto; name: string } | null;
+  /** weighted layers after the merge (chain models: all of them); the last one produces the outputs */
+  trunk: Layer[];
+  /** every weighted layer: branch layers in branch order, then the trunk */
+  layers: Layer[];
   /** pre-softmax output tensor (== last layer's actTensor) */
   outputTensor: string;
   graphOutput: string;
   softmaxInGraph: boolean;
-  inputIsImage: boolean;
   warnings: string[];
   /** extra tensors to request from onnxruntime */
   fetch: string[];
@@ -57,7 +81,7 @@ const UNARY = new Set([
   "InstanceNormalization", "LayerNormalization", "MaxPool", "AveragePool", "GlobalAveragePool", "GlobalMaxPool", "ReduceMean",
   "ReduceMax", "ReduceSum", "Neg", "Abs", "Exp", "Log", "Sqrt", "Erf", "Floor", "Ceil", "Round", "Gemm", "Conv", "LpNormalization",
 ]);
-const BINARY = new Set(["Add", "Sub", "Mul", "Div", "MatMul", "Pow", "Max", "Min"]);
+const BINARY = new Set(["Add", "Sub", "Mul", "Div", "MatMul", "Pow", "Max", "Min", "Concat"]);
 
 export class UnsupportedGraph extends Error {}
 
@@ -69,12 +93,11 @@ export function buildPlan(m: ModelInfo): Plan {
     if (n.opType === "Constant" || (ins.length && ins.every((i) => consts.has(i)) && n.opType !== "Shape")) n.outputs.forEach((o) => consts.add(o));
   }
   const realInputs = m.inputs.filter((i) => !m.initializers.has(i.name));
-  if (realInputs.length !== 1)
-    throw new UnsupportedGraph(`netglow v0 needs a model with exactly one input tensor; this one has ${realInputs.length} (${realInputs.map((i) => i.name).join(", ")}).`);
-  const input = realInputs[0];
+  if (!realInputs.length) throw new UnsupportedGraph("The model declares no input tensor.");
   if (!m.outputs.length) throw new UnsupportedGraph("The model declares no outputs.");
   const graphOutput = m.outputs[0].name;
   if (m.outputs.length > 1) warnings.push(`The model has ${m.outputs.length} outputs; netglow shows the first one (${graphOutput}).`);
+  const inputIdx = new Map(realInputs.map((v, i) => [v.name, i]));
 
   const producer = new Map<string, NodeProto>();
   for (const n of m.nodes) n.outputs.forEach((o) => producer.set(o, n));
@@ -83,79 +106,116 @@ export function buildPlan(m: ModelInfo): Plan {
     const ins = n.inputs.filter(Boolean);
     if (UNARY.has(n.opType)) return ins[0] && !consts.has(ins[0]) ? [ins[0]] : [];
     if (BINARY.has(n.opType)) return ins.filter((i) => !consts.has(i));
-    throw new UnsupportedGraph(`netglow v0 does not support the "${n.opType}" op on the signal path (node "${n.name || n.outputs[0]}"). Supported: MLPs and CNN encoder + MLP head chains.`);
+    throw new UnsupportedGraph(`netglow does not support the "${n.opType}" op on the signal path (node "${n.name || n.outputs[0]}"). Supported: MLPs, CNN encoder + MLP head chains, and several inputs joined by one Concat.`);
+  };
+  const nodeName = (n: NodeProto) => n.name || n.outputs[0];
+
+  // walk back from tensor t along the data path until a model input or a node that joins several signals
+  const seen = new Set<string>();
+  const walk = (t: string): { chain: NodeProto[]; input: string | null; join: NodeProto | null } => {
+    const chain: NodeProto[] = [];
+    while (!inputIdx.has(t)) {
+      if (seen.has(t)) throw new UnsupportedGraph("Cycle in graph, or one tensor feeds two branches.");
+      seen.add(t);
+      const n = producer.get(t);
+      if (!n) throw new UnsupportedGraph(`Tensor "${t}" has no producer and is not a model input.`);
+      const d = dataInputs(n);
+      if (!d.length) throw new UnsupportedGraph(`Node "${nodeName(n)}" (${n.opType}) does not depend on any input.`);
+      if (d.length > 1) return { chain: chain.reverse(), input: null, join: n };
+      chain.push(n);
+      t = d[0];
+    }
+    return { chain: chain.reverse(), input: t, join: null };
   };
 
-  // walk back from the output along the data path
-  const chain: NodeProto[] = [];
-  let t = graphOutput;
-  const seen = new Set<string>();
-  while (t !== input.name) {
-    if (seen.has(t)) throw new UnsupportedGraph("Cycle in graph.");
-    seen.add(t);
-    const n = producer.get(t);
-    if (!n) throw new UnsupportedGraph(`Tensor "${t}" has no producer and is not the model input.`);
-    const d = dataInputs(n);
-    if (d.length !== 1)
-      throw new UnsupportedGraph(`netglow v0 supports chain-shaped networks only. Node "${n.name || n.outputs[0]}" (${n.opType}) ${d.length ? "joins two branches (a skip connection, concat or gating)" : "does not depend on the input"}.`);
-    chain.push(n);
-    t = d[0];
+  const top = walk(graphOutput);
+  const chains: { nodes: NodeProto[]; input: number; concatIn: string | null }[] = [];
+  let merge: Plan["merge"] = null;
+  if (top.join) {
+    const j = top.join;
+    if (j.opType !== "Concat")
+      throw new UnsupportedGraph(`netglow supports chain-shaped networks, or several inputs joined by one Concat. Node "${nodeName(j)}" (${j.opType}) joins two branches (a skip connection or gating).`);
+    const axis = j.attrs.get("axis")?.i ?? 1;
+    if (axis !== 1 && axis !== -1) throw new UnsupportedGraph(`Concat "${nodeName(j)}" joins along axis ${axis}; netglow expects flat features joined along axis 1.`);
+    merge = { node: j, name: nodeName(j) };
+    for (const t of dataInputs(j)) {
+      const b = walk(t);
+      if (b.join) throw new UnsupportedGraph(`Node "${nodeName(b.join)}" (${b.join.opType}) joins signals inside a branch; netglow supports one Concat that joins whole inputs.`);
+      chains.push({ nodes: b.chain, input: inputIdx.get(b.input!)!, concatIn: t });
+    }
+    const used = new Set(chains.map((c) => c.input));
+    if (used.size !== chains.length) throw new UnsupportedGraph("One input feeds the Concat twice; netglow expects one branch per input.");
+    if (used.size !== realInputs.length) throw new UnsupportedGraph(`The model has ${realInputs.length} inputs but only ${used.size} reach the output.`);
+  } else {
+    if (realInputs.length !== 1)
+      throw new UnsupportedGraph(`The model has ${realInputs.length} inputs but only "${top.input}" reaches the output.`);
+    chains.push({ nodes: [], input: 0, concatIn: null });
   }
-  chain.reverse();
+  const trunkNodes = top.chain;
 
   const isWeighted = (n: NodeProto) =>
     n.opType === "Conv" || n.opType === "Gemm" || (n.opType === "MatMul" && n.inputs.some((i) => m.initializers.has(i)));
-  const wIdx = chain.map((n, i) => (isWeighted(n) ? i : -1)).filter((i) => i >= 0);
-  if (!wIdx.length) throw new UnsupportedGraph("No weighted layers (Gemm, MatMul or Conv) found on the signal path.");
-
   const dataIn = (n: NodeProto) => dataInputs(n)[0];
-  const layers: Layer[] = [];
+  const nTotal = [...chains.map((c) => c.nodes), trunkNodes].reduce((a, ns) => a + ns.filter(isWeighted).length, 0);
+  let k = 0;
   let softmaxInGraph = false;
-  for (let k = 0; k < wIdx.length; k++) {
-    const n = chain[wIdx[k]];
-    const end = k + 1 < wIdx.length ? wIdx[k + 1] : chain.length;
-    // shown tensor: the last non-reshape node before the next weighted one (for the last layer, before a softmax)
-    let a = wIdx[k];
-    for (let i = wIdx[k] + 1; i < end; i++) {
-      const op = chain[i].opType;
-      if (k + 1 === wIdx.length && (op === "Softmax" || op === "LogSoftmax")) {
-        softmaxInGraph = true;
-        break;
+  // weighted layers of one chain; shown tensor = the last non-reshape node before the next weighted one
+  // (for the very last layer: before a softmax)
+  const layersOf = (chain: NodeProto[], isTrunk: boolean): Layer[] => {
+    const wIdx = chain.map((n, i) => (isWeighted(n) ? i : -1)).filter((i) => i >= 0);
+    const out: Layer[] = [];
+    for (let q = 0; q < wIdx.length; q++) {
+      const n = chain[wIdx[q]];
+      const end = q + 1 < wIdx.length ? wIdx[q + 1] : chain.length;
+      const lastOverall = isTrunk && q + 1 === wIdx.length;
+      let a = wIdx[q];
+      for (let i = wIdx[q] + 1; i < end; i++) {
+        const op = chain[i].opType;
+        if (lastOverall && (op === "Softmax" || op === "LogSoftmax")) {
+          softmaxInGraph = true;
+          break;
+        }
+        if (op === "Transpose" && q + 1 < wIdx.length) warnings.push(`A Transpose sits between layer ${k + 1} and ${k + 2}; edge attribution there assumes the original element order.`);
+        if (!RESHAPE.has(op)) a = i;
       }
-      if (op === "Transpose" && k + 1 < wIdx.length) warnings.push(`A Transpose sits between layer ${k + 1} and ${k + 2}; edge attribution there assumes the original element order.`);
-      if (!RESHAPE.has(op)) a = i;
+      out.push(weightedLayer(n, dataIn(n), chain[a].outputs[0], m, k++, nTotal));
     }
-    const actTensor = chain[a].outputs[0];
-    layers.push(weightedLayer(n, dataIn(n), actTensor, m, k, wIdx.length));
-  }
-  const last = layers[layers.length - 1];
-  if (last.kind !== "dense") throw new UnsupportedGraph("The last weighted layer is a convolution; netglow v0 expects a dense output head.");
-  for (let k = 0; k + 1 < layers.length; k++) {
-    const next = layers[k + 1];
-    if (layers[k].kind === "dense" && next.kind === "conv") throw new UnsupportedGraph("A dense layer feeds a convolution (decoder-style); not supported in v0.");
-  }
-  const inputIsImage = input.shape?.length === 4;
-  if (input.shape && input.shape.length > 4) throw new UnsupportedGraph(`Input rank ${input.shape.length} is not supported (use [N, features] or [N, C, H, W]).`);
-  if (input.shape?.length === 3) throw new UnsupportedGraph("Sequence inputs [N, T, F] are not supported in v0.");
-  if (inputIsImage && layers[0].kind !== "conv" && layers[0].kind !== "dense") warnings.push("Image input without a leading conv.");
-  if (![ELEM.FLOAT, ELEM.UINT8, ELEM.INT8, ELEM.DOUBLE, ELEM.INT64, ELEM.INT32].includes(input.elemType as never))
-    throw new UnsupportedGraph(`Input element type ${input.elemType} is not supported.`);
-
-  const fetch = layers.map((l) => l.actTensor);
-  if (layers[0].inTensor !== input.name) fetch.push(layers[0].inTensor);
-  if (!fetch.includes(graphOutput)) fetch.push(graphOutput);
-  return {
-    inputName: input.name,
-    inputElemType: input.elemType,
-    inputShape: input.shape ?? [],
-    layers,
-    outputTensor: last.actTensor,
-    graphOutput,
-    softmaxInGraph,
-    inputIsImage,
-    warnings,
-    fetch,
+    for (let q = 0; q + 1 < out.length; q++)
+      if (out[q].kind === "dense" && out[q + 1].kind === "conv") throw new UnsupportedGraph("A dense layer feeds a convolution (decoder-style); not supported.");
+    return out;
   };
+  const branches: Branch[] = chains.map((c) => ({ input: c.input, layers: layersOf(c.nodes, false), concatIn: c.concatIn }));
+  const trunk = layersOf(trunkNodes, true);
+  if (!trunk.length) throw new UnsupportedGraph(merge ? "The Concat must feed a dense layer (Gemm or MatMul)." : "No weighted layers (Gemm, MatMul or Conv) found on the signal path.");
+  const last = trunk[trunk.length - 1];
+  if (last.kind !== "dense") throw new UnsupportedGraph("The last weighted layer is a convolution; netglow expects a dense output head.");
+  if (merge && trunk[0].kind !== "dense") throw new UnsupportedGraph("A convolution right after the Concat is not supported; join flat features into a dense layer.");
+  if (merge && trunkNodes.slice(0, trunkNodes.indexOf(trunk[0].node)).some((n) => !RESHAPE.has(n.opType)))
+    warnings.push("An elementwise op sits between the Concat and the first dense layer; edges into it use that op's output.");
+  for (const b of branches) {
+    const l = b.layers.at(-1);
+    if (l && l.kind === "dense" && trunk[0].kind === "conv") throw new UnsupportedGraph("A dense layer feeds a convolution (decoder-style); not supported.");
+  }
+
+  const inputs: PlanInput[] = realInputs.map((v) => {
+    if (v.shape && v.shape.length > 4) throw new UnsupportedGraph(`Input "${v.name}" has rank ${v.shape.length}; use [N, features] or [N, C, H, W].`);
+    if (v.shape?.length === 3) throw new UnsupportedGraph(`Input "${v.name}": sequence inputs [N, T, F] are not supported.`);
+    if (![ELEM.FLOAT, ELEM.UINT8, ELEM.INT8, ELEM.DOUBLE, ELEM.INT64, ELEM.INT32].includes(v.elemType as never))
+      throw new UnsupportedGraph(`Input "${v.name}" has element type ${v.elemType}, which is not supported.`);
+    return { name: v.name, elemType: v.elemType, shape: v.shape ?? [], isImage: v.shape?.length === 4 };
+  });
+  if (inputs.filter((i) => i.isImage).length > 1) throw new UnsupportedGraph("netglow shows one image input per model; this one has several.");
+
+  const layers = [...branches.flatMap((b) => b.layers), ...trunk];
+  const fetch = layers.map((l) => l.actTensor);
+  const add = (t: string | null) => t && !inputIdx.has(t) && !fetch.includes(t) && fetch.push(t);
+  for (const b of branches) {
+    add(b.layers[0]?.inTensor ?? null);
+    add(b.concatIn);
+  }
+  add(trunk[0].inTensor);
+  add(graphOutput);
+  return { inputs, branches, merge, trunk, layers, outputTensor: last.actTensor, graphOutput, softmaxInGraph, warnings, fetch };
 }
 
 function weightedLayer(n: NodeProto, inTensor: string, actTensor: string, m: ModelInfo, k: number, nLayers: number): Layer {

@@ -36,6 +36,22 @@ video never leave your machine.
   frames. **Newest frame**: last channels by default (first for stacks stored newest first). All three can
   be overridden in the View panel, which also says what was detected.
 
+### Mixed inputs: an image and plain numbers
+
+![netglow showing a LunarLander pilot that reads two inputs: frames and six numbers](docs/screenshot-mixed.png)
+
+- Models with several ONNX inputs, e.g. `frames` `[N, C, H, W]` and `vector` `[N, D]`, each running through its
+  own branch (a conv stack, dense layers, or nothing at all) and joined by one `Concat` before the dense head.
+- Each branch gets its own lane: the image input is the image node with its "What the AI sees" view and live
+  feature maps on the conv branch; the numbers are labelled, draggable input rows like an MLP's. Both lanes feed
+  the merged dense column with their real activations.
+- Attribution stays exact at the join: the dense layer's weight columns are split per branch, so a number's edge
+  is `W[j, i] · x[i]` and a conv channel's edge is `Σ_pixels W[j, c, p] · a[c, p]`, read from the real `Concat`
+  output. Edges into one column share one scale, so the two branches are drawn on a common footing.
+- Demo **LunarLander, pixels + numbers** (`?demo=lunar-mixed`): 64×64 frames plus x / y speed, angle, spin and
+  leg contacts. It landed 50 of 50 fresh seeds (mean return 276); with the velocities handed over as numbers the
+  task is much easier than flying from pixels alone (the CNN demo landed 11 of 20 eval seeds).
+
 ## 30-second quickstart
 
 ```bash
@@ -65,6 +81,10 @@ per model in this browser (localStorage). **Save and share** in the View panel r
 exports or imports the settings as JSON, and copies a link whose `#look=…` hash carries the look (not the
 model or the recording) to anyone who opens it. Lengths are pixels at 720 p and scale with the export size.
 
+Nothing is drawn on top of anything else: pictures, input labels and output labels take their measured widths
+first, the columns share what is left (never closer than their nodes need), node and text sizes never exceed
+their row pitch, and when even that does not fit, the whole picture is scaled down uniformly.
+
 | Group | Setting | Default | Range / options |
 | --- | --- | --- | --- |
 | View | Nodes per column | 10 | 3 to 24 |
@@ -81,7 +101,7 @@ model or the recording) to anyone who opens it. Lengths are pixels at 720 p and 
 | Layout and size | Column spacing, row spacing | 1×, 1× | 0.4× to 1.4×, 0.4× to 1.8× |
 | Layout and size | Canvas padding | 28 px | 0 to 96 px |
 | Layout and size | Column titles | on | toggle |
-| Pictures | What the AI sees: position, size | above, 1× | above, beside left / right, a corner, off; 0.3× to 2× |
+| Pictures | What the AI sees: position, size | above, 1× | above, beside left / right, a corner (beside, aligned to the top or bottom), off; 0.3× to 2× |
 | Pictures | Recording: position, size | next to the AI view, 1× | same positions; 0.3× to 2× |
 | Look | Glow | 1× | 0 to 3× |
 | Look | Decision pulse, strength | on, 1× | toggle, 0 to 5× |
@@ -95,13 +115,15 @@ model or the recording) to anyone who opens it. Lengths are pixels at 720 p and 
 ### Model: `.onnx`
 
 - One input tensor: `[N, features]` (MLP) or `[N, C, H, W]` (image, any dtype; in-graph `Cast` / `Div` are fine).
+  Or several inputs, each with its own chain, joined by one `Concat` (axis 1) that feeds a dense layer; at most one
+  of them an image.
 - Batch axis dynamic or fixed at 1. Weights embedded in the file (no external data).
 - Chain-shaped: every node on the signal path has exactly one signal input. Supported weighted layers:
   `Gemm`, `MatMul` (constant weight on the right), `Conv` (group 1, explicit pads). Anything elementwise or
   reshaping between them is fine (`Relu`, `Tanh`, `BatchNormalization`, `MaxPool`, `Flatten`, ...).
 - The first graph output is shown. A trailing `Softmax` is detected and the logits before it are used.
 
-Graphs outside this shape (skip connections, concatenated multi-input towers, attention, recurrent cells) are
+Graphs outside this shape (skip connections, gating, a Concat inside a branch, attention, recurrent cells) are
 rejected with a message that names the node where the chain breaks.
 
 ### Recording: `.npz`, `.npy` or `.json`
@@ -109,6 +131,7 @@ rejected with a message that names the node where the chain breaks.
 | key | shape | required | meaning |
 | --- | --- | --- | --- |
 | `obs` | `(T, *input_shape)` | yes | the model input at every tick (a `.npy` file is taken as `obs`) |
+| `obs_<name>` | `(T, *shape)` | instead of `obs`, one per input | several model inputs: one array per ONNX input name (e.g. `obs_frames`, `obs_vector`) |
 | `actions` | `(T,)` int or `(T, A)` float | no | what was executed; used by the match check |
 | `outputs` | `(T, n_out)` | no | raw model outputs logged at record time; match check |
 | `t` | `(T,)` seconds | no | timestamps; sets the decision rate |
@@ -131,6 +154,11 @@ Plain arrays only: object / pickled arrays are refused.
   "input_units": ["", "", "", "", "rad", "", "0/1", "0/1"]
 }
 ```
+
+With several model inputs, `inputs` names every input in model order and an image input takes one name, e.g.
+`["camera", "x speed", "y speed", "angle", "spin", "left leg", "right leg"]` for frames + 6 numbers.
+`python/export_recording.py` writes this format: `save_recording(path, {"frames": f, "vector": v}, ...)`,
+`export_onnx(net, (f0, v0), path, input_name=["frames", "vector"])`.
 
 Icons are tinted to the theme. Dropped icon files are matched to outputs by the basename in `icons`, by
 index (`0.svg`, `out_0.png`) or by output label (`main_engine.svg`). Every label and icon can also be edited
@@ -156,8 +184,8 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 
 ## Limitations (v0)
 
-- Chain-shaped graphs only (MLP, CNN encoder + MLP head). No residuals, multi-input, RNN / attention.
-- One input tensor. Mixed image + vector observations need a single concatenated input for now.
+- Chain-shaped graphs, or several input branches joined by one `Concat`. No residuals, RNN / attention.
+- At most one image input per model.
 - Image inputs must be channels-first `[N, C, H, W]`; a channels-last model (leading `Transpose`) is rejected.
 - Grouped / depthwise convolutions are rejected; `Transpose` between conv and dense is warned about.
 - The whole trace is held in memory: fine for small policies and recordings of a few thousand ticks.
@@ -171,7 +199,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | File | Owns |
 | --- | --- |
 | `src/onnx/proto.ts` | reading ONNX protobuf (nodes, weights, value infos) and appending graph outputs |
-| `src/analyze.ts` | finding the chain of weighted layers and which tensors to fetch |
+| `src/analyze.ts` | finding the weighted layers (per input branch, then the trunk after the Concat) and which tensors to fetch |
 | `src/run.ts` | onnxruntime-web session, batched run over the recording |
 | `src/compute.ts` | contributions, node selection, normalisation, match check |
 | `src/render.ts` | drawing one frame on a canvas, themes, image node, feature maps, hit-testing for drag |
@@ -190,7 +218,9 @@ MIT
 With `npm run dev -- --port 5181` running (fixtures come from `test/make_fixtures.py`):
 
 ```bash
-node test/smoke.mjs mlp        # also: cnn, rgbf, residual (expects a clear rejection), demo:lunar-mlp
+node test/smoke.mjs mlp        # also: cnn, rgbf, mixed, residual (expects a clear rejection), demo:lunar-mlp
+node test/mixed.mjs            # two-input demo: match, lanes, edges from both branches, drag, short GIF
+node test/panel.mjs            # extreme sizes: no picture, label, title or column overlaps another
 node test/image.mjs            # image node, AI view, feature maps, pixel-range detection
 node test/drag.mjs             # drag and keyboard reorder
 node test/settings.mjs         # sizes and look change the render and the export; persist, reset, JSON, share link

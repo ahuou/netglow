@@ -11,7 +11,7 @@
 // much the frame changed), optionally a large "What the AI sees" view above or beside the network, and conv
 // channels can be drawn as their live feature maps instead of dots.
 
-import type { Viz } from "./compute";
+import type { Viz, VizColumn } from "./compute";
 import type { NdArray } from "./io/npy";
 import { frameRGBA, type ImageView } from "./image";
 
@@ -110,8 +110,10 @@ interface Pic {
   w: number;
   h: number;
   caption: string;
-  /** corner insets are drawn on top of the network */
+  /** corner positions only choose the vertical alignment of a picture beside the network; nothing is drawn on top */
   corner: boolean;
+  /** caption font size */
+  capPx: number;
 }
 
 type RGB = [number, number, number];
@@ -176,6 +178,18 @@ export interface Hit {
   slot: number;
 }
 
+/** an axis-aligned box the layout reserved for one thing; tests check that boxes of different things never overlap */
+export interface Box {
+  kind: string;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+const SANS = `"Public Sans", system-ui, sans-serif`;
+const MONO = `"JetBrains Mono", ui-monospace, monospace`;
+
 export class Renderer {
   private ease: Float32Array[] | null = null;
   private lastTick = -1;
@@ -183,7 +197,7 @@ export class Renderer {
   private frameCanvas = document.createElement("canvas");
   private tinted = new Map<string, HTMLCanvasElement>();
   private mapCanvas = document.createElement("canvas");
-    // layout, recomputed in draw
+  // layout, recomputed in draw
   X: number[] = [];
   Y: number[][] = [];
   r = 10;
@@ -196,8 +210,20 @@ export class Renderer {
   private headerY = 40;
   /** column titles as last drawn (for tests and hit checks); never overlapping */
   titleBoxes: TitleBox[] = [];
+  /** everything the last layout placed: pictures, titles, label boxes, columns (for overlap tests) */
+  boxes: Box[] = [];
+  /** uniform shrink applied because the content did not fit the width at full size (1 = none) */
+  fit = 1;
   private bandTop = 0;
   private textX = 28;
+  private titleLo = 0;
+  private titleHi = 0;
+  /** length unit: pixels per "720 p pixel", times the fit shrink */
+  private u = 1;
+  /** text sizes after fitting rows: input label / value, output label, output pill scale */
+  private fonts = { inLabel: 17, inValue: 15, out: 16, ls: 1 };
+  /** widest value readout per input column (monospace pattern), measured once */
+  private valuePattern = new Map<number, string>();
 
   constructor(public viz: Viz, public labels: Labels, public opt: RenderOpts) {}
 
@@ -206,15 +232,40 @@ export class Renderer {
     this.lastTick = -1;
   }
 
-  private layout() {
+  /**
+   * Lay everything out without overlap: pictures and text take their measured widths first, the network columns
+   * get what is left (with a minimum spacing per pair of columns), and if even that does not fit, everything is
+   * scaled down uniformly until it does. Returns the length unit to draw with.
+   */
+  private layout(ctx: CanvasRenderingContext2D): number {
+    let f = 1;
+    for (let it = 0; it < 10; it++) {
+      const need = this.place(ctx, f);
+      if (need <= this.opt.width + 0.5 || f <= 0.3) break;
+      f = Math.max(0.3, f * Math.min(0.97, this.opt.width / need));
+    }
+    return this.u;
+  }
+
+  /** one layout attempt at shrink factor f; returns the width it needs */
+  private place(ctx: CanvasRenderingContext2D, f: number): number {
     const { width: W, height: H } = this.opt;
     const s = H / 720;
-    const cols = this.viz.cols;
+    const u = s * f;
+    this.u = u;
+    this.fit = f;
     const o = this.opt;
     const st = o.style;
-    const cap = 30 * s;
     const m = st.padding * s;
-    // pictures: the recording's render and / or what the AI sees, each placed by its own position
+    const cap = 30 * u;
+    const boxes: Box[] = [];
+    const font = (w: number, px: number, mono = false) => `${w} ${px}px ${mono ? MONO : SANS}`;
+    const measure = (t: string, f0: string) => {
+      ctx.font = f0;
+      return ctx.measureText(t).width;
+    };
+
+    // ---- pictures: the recording's render and / or what the AI sees, each placed by its own position
     const want: { kind: Pic["kind"]; w0: number; h0: number; caption: string; pos: PicPos; scale: number }[] = [];
     const aiOn = !!o.image && st.aiPos !== "off";
     if (o.showFrame && o.frames && st.recPos !== "off") {
@@ -222,14 +273,24 @@ export class Renderer {
       want.push({ kind: "rec", w0: o.frames.shape[2], h0: o.frames.shape[1], caption: "Recording", pos, scale: st.recScale });
     }
     if (aiOn) want.push({ kind: "ai", w0: o.image!.W, h0: o.image!.H, caption: `What the AI sees (${o.image!.W}×${o.image!.H})`, pos: st.aiPos, scale: st.aiScale });
-    let left = 0;
-    let right = 0;
-    let topBand = 0;
     this.pics = [];
+    let topBand = 0;
+    const cols = this.viz.cols;
+    // the least height each lane needs: a row per node with room for its label, an image node at a readable size
+    const lanes = this.viz.lanes;
+    const laneMin = Array.from({ length: lanes }, (_, l) => {
+      const lc = cols.filter((c) => (lanes <= 1 ? true : c.lane === l));
+      return Math.max(...lc.map((c) => (c.image ? 96 * s : c.sel.length * 22 * s)), 22 * s);
+    });
+    const fullMin = Math.max(0, ...cols.filter((c) => c.lane < 0).map((c) => c.sel.length * 22 * s));
+    const laneGap = 30 * u;
+    const netMin = Math.max(fullMin, laneMin.reduce((a, b) => a + b, 0) + laneGap * (lanes - 1)) + 2 * m + 48 * s;
     const above = want.filter((p) => p.pos === "above");
     if (above.length) {
+      // a band across the top: it never competes for width, and it leaves the network the height it needs
+      const capS = 30 * s;
       const gap = 40 * s;
-      const base = H * 0.42 - cap - 14 * s;
+      const base = Math.max(H * 0.15, Math.min(H * 0.42, H - netMin) - capS - 14 * s);
       let hs = above.map((p) => base * p.scale);
       let ws = above.map((p, i) => (hs[i] * p.w0) / p.h0);
       const total = ws.reduce((a, b) => a + b, 0) + gap * (above.length - 1);
@@ -239,91 +300,275 @@ export class Renderer {
       let x = (W - (ws.reduce((a, b) => a + b, 0) + gap * (above.length - 1))) / 2;
       const hMax = Math.max(...hs);
       above.forEach((p, i) => {
-        this.pics.push({ kind: p.kind, x, y: 14 * s + cap + (hMax - hs[i]), w: ws[i], h: hs[i], caption: p.caption, corner: false });
+        this.pics.push({ kind: p.kind, x, y: 14 * s + capS + (hMax - hs[i]), w: ws[i], h: hs[i], caption: p.caption, corner: false, capPx: 15 * s });
         x += ws[i] + gap;
       });
-      topBand = 14 * s + cap + hMax;
+      topBand = 14 * s + capS + hMax;
     }
+    // beside and corner pictures take a column on their side; corners only pick the vertical alignment
+    let leftEdge = m;
+    let rightEdge = W - m;
     for (const side of ["left", "right"] as const) {
-      const group = want.filter((p) => p.pos === side);
+      const group = want
+        .filter((p) => p.pos === side || (p.pos.length === 2 && p.pos[1] === side[0]))
+        .sort((a, b) => (a.pos === side ? 1 : a.pos[0] === "t" ? 0 : 2) - (b.pos === side ? 1 : b.pos[0] === "t" ? 0 : 2));
       if (!group.length) continue;
-      const gap = 20 * s;
-      const each = Math.min((H - 2 * m - group.length * cap - gap * (group.length - 1)) / group.length, H * 0.62);
-      const sizes = group.map((p) => {
-        const maxW = W * 0.3 * p.scale;
-        let h = each * p.scale;
+      const gap = 20 * u;
+      const yTop = topBand ? topBand + 16 * u : m;
+      const yBot = H - m;
+      const avail = yBot - yTop;
+      const n = group.length;
+      const each = Math.min((avail - n * cap - gap * (n - 1)) / n, H * 0.62);
+      let sizes = group.map((p) => {
+        const corner = p.pos.length === 2;
+        let h = (corner ? H * 0.28 : each) * p.scale;
         let w = (h * p.w0) / p.h0;
+        const maxW = W * (corner ? 0.35 : 0.3) * p.scale;
         if (w > maxW) {
           w = maxW;
           h = (w * p.h0) / p.w0;
         }
-        return [w, h];
+        return [w * f, h * f];
       });
-      let y = (H - sizes.reduce((a, [, h]) => a + h + cap, 0) - gap * (group.length - 1)) / 2;
+      const fixedH = n * cap + gap * (n - 1);
+      const picH = sizes.reduce((a, [, h]) => a + h, 0);
+      if (picH + fixedH > avail) {
+        const k = Math.max(0.05, (avail - fixedH) / picH);
+        sizes = sizes.map(([w, h]) => [w * k, h * k]);
+      }
+      const totalH = sizes.reduce((a, [, h]) => a + h, 0) + fixedH;
+      const corner = (p: (typeof group)[number], c: string) => p.pos.length === 2 && p.pos[0] === c;
+      let y = group.every((p) => corner(p, "t")) ? yTop : group.every((p) => corner(p, "b")) ? yBot - totalH : yTop + (avail - totalH) / 2;
       const wMax = Math.max(...sizes.map(([w]) => w));
       group.forEach((p, i) => {
         const [w, h] = sizes[i];
-        this.pics.push({ kind: p.kind, x: side === "left" ? m : W - m - w, y: y + cap, w, h, caption: p.caption, corner: false });
+        this.pics.push({ kind: p.kind, x: side === "left" ? m : W - m - w, y: y + cap, w, h, caption: p.caption, corner: false, capPx: 15 * u });
         y += cap + h + gap;
       });
-      if (side === "left") left = m + wMax + 12 * s;
-      else right = wMax + 12 * s;
+      if (side === "left") leftEdge = m + wMax + 24 * u;
+      else rightEdge = W - m - wMax - 24 * u;
     }
-    for (const p of want.filter((q) => q.pos.length === 2)) {
-      let h = H * 0.28 * p.scale;
-      let w = (h * p.w0) / p.h0;
-      if (w > W * 0.35 * p.scale) {
-        w = W * 0.35 * p.scale;
-        h = (w * p.h0) / p.w0;
-      }
-      const x = p.pos[1] === "l" ? m : W - m - w;
-      const y = p.pos[0] === "t" ? m + cap : H - m - h;
-      this.pics.push({ kind: p.kind, x, y, w, h, caption: p.caption, corner: true });
+    // captions never run past their picture: shrink a little, then cut with "…"
+    for (const p of this.pics) {
+      let px = p.capPx;
+      while (px > p.capPx * 0.75 && measure(p.caption, font(500, px)) > p.w) px *= 0.94;
+      p.capPx = px;
+      p.caption = ellipsize(ctx, p.caption, Math.max(p.w, 10 * u));
+      boxes.push({ kind: `pic ${p.kind}`, x0: p.x, y0: p.y - 10 * u - px, x1: p.x + p.w, y1: p.y + p.h });
     }
-    this.headerY = topBand + m + 12 * s;
+
+    // ---- vertical: title row, then the band the columns live in, split into lanes for multi-input models
+    this.headerY = topBand + m + 12 * u;
     this.bandTop = topBand;
-    const top = topBand + m + 58 * s;
-    const bot = H - m - 12 * s;
-    // image node size (image models): the frame at a size where its pixels are visible
-    let labelW = 200 * s;
-    this.imgRect = null;
-    if (this.viz.imageInput && o.image) {
-      const th = Math.min(124 * s, (bot - top) * 0.5) * st.imageScale;
-      const tw = Math.min(160 * s * st.imageScale, (th * o.image.W) / o.image.H);
-      labelW = tw + 96 * s;
-      this.imgRect = [0, 0, tw, (tw * o.image.H) / o.image.W];
-    }
-    const outW = 196 * s + m + right;
-    this.textX = left + (left ? 0 : m);
-    let x0 = this.textX + labelW;
-    let x1 = W - outW;
-    if (st.colSpacing !== 1) {
-      const c = (x0 + x1) / 2;
-      const hw = ((x1 - x0) / 2) * st.colSpacing;
-      x0 = c - hw;
-      x1 = c + hw;
-    }
     const nc = cols.length;
-    this.X = cols.map((_, i) => x0 + ((x1 - x0) * i) / Math.max(1, nc - 1));
-    const maxN = Math.max(...cols.map((c) => c.sel.length));
-    const pitch = Math.min(46 * s, (bot - top) / Math.max(1, maxN - 1));
-    this.r = Math.max(3, Math.min(11 * s, pitch * 0.3)) * st.nodeScale;
-    this.mapSize = Math.max(6, Math.min(pitch * 0.78, 38 * s)) * st.mapScale;
-    this.half = cols.map((c, ci) => (ci === 0 && this.imgRect ? 2 * s : o.showMaps && c.maps ? this.mapSize / 2 : this.r));
-    this.Y = cols.map((c) => {
+    const stages = this.viz.stages;
+    const imgCol = cols.findIndex((c) => c.kind === "input" && c.image);
+    const vecInputs = cols.map((c, ci) => (c.kind === "input" && !c.image ? ci : -1)).filter((ci) => ci >= 0);
+    const outCi = nc - 1;
+    const isMap = (c: VizColumn) => o.showMaps && !!c.maps;
+    const bot = H - m - 2 * u;
+    const P: number[] = new Array(nc);
+    const p: number[] = new Array(nc);
+    const band: [number, number][] = new Array(nc);
+    const vertical = (top: number) => {
+      const laneBand: [number, number][] = [];
+      if (lanes <= 1) laneBand.push([top, bot]);
+      else {
+        const gap = laneGap;
+        const w = laneMin;
+        const span = bot - top - gap * (lanes - 1);
+        const sum = w.reduce((a, b) => a + b, 0);
+        let y = top;
+        for (let l = 0; l < lanes; l++) {
+          laneBand.push([y, y + (span * w[l]) / sum]);
+          y += (span * w[l]) / sum + gap;
+        }
+      }
+      cols.forEach((c, ci) => {
+        band[ci] = c.lane < 0 ? [top, bot] : laneBand[c.lane];
+        P[ci] = (band[ci][1] - band[ci][0]) / Math.max(1, c.sel.length);
+      });
+      const pitch = Math.min(46 * u, ...P);
+      cols.forEach((c, ci) => {
+        // each column spreads over its own band; lanes of a multi-input model each have their own pitch
+        const own = Math.min(46 * u, P[ci]);
+        const want = c.kind === "hidden" ? own * st.rowSpacing : Math.min(own * 1.25, 56 * u) * st.rowSpacing;
+        p[ci] = Math.min(want, P[ci]);
+      });
+      // node and tile sizes never exceed the row pitch they sit in
+      const minP = (pred: (c: VizColumn) => boolean) => Math.min(Infinity, ...cols.filter((c) => pred(c) && c.sel.length > 1).map((c) => p[cols.indexOf(c)]));
+      this.r = Math.min(Math.max(3, Math.min(11 * u, pitch * 0.3)) * st.nodeScale, 0.46 * minP((c) => !c.image && !isMap(c)));
+      this.mapSize = Math.min(Math.max(6, Math.min(pitch * 0.78, 38 * u)) * st.mapScale, 0.9 * minP(isMap) - 4 * u);
+      this.mapSize = Math.max(4, this.mapSize);
+    };
+    const titleRow = 15 * u;
+    let top = this.headerY + titleRow / 2 + 26 * u;
+    vertical(top);
+
+    // ---- text widths, measured: input labels and values on the left, output pills and values on the right
+    const fsIn = Math.min(st.labelSize * u, 0.9 * Math.min(Infinity, ...vecInputs.filter((ci) => cols[ci].sel.length > 1).map((ci) => p[ci])));
+    const fsVal = Math.min(st.valueSize * u, fsIn * 1.1, 0.9 * Math.min(Infinity, ...vecInputs.filter((ci) => cols[ci].sel.length > 1).map((ci) => p[ci])));
+    const outCol = cols[outCi];
+    const ls0 = (st.labelSize - 1) / 16;
+    const q = outCol.sel.length > 1 ? Math.min(1, (0.92 * p[outCi]) / (30 * u * ls0)) : 1;
+    this.fonts = { inLabel: fsIn, inValue: fsVal, out: (st.labelSize - 1) * u * q, ls: ls0 * q };
+    const r = this.r;
+    let labelW = 0;
+    for (const ci of vecInputs) {
+      const c = cols[ci];
+      const vw = st.showValues ? measure(this.valueText(ci), font(400, fsVal, true)) : 0;
+      for (const unit of c.sel) {
+        const lw = measure(this.inputLabel(c, unit), font(600, fsIn));
+        labelW = Math.max(labelW, lw + (vw ? 14 * u + vw : 0) + 12 * u + r);
+      }
+    }
+    // image node size: the frame at a size where its pixels are visible, inside its band (with the stack below it)
+    let tw = 0;
+    let th = 0;
+    let stackH = 0;
+    if (imgCol >= 0 && o.image) {
+      const iv = o.image;
+      const [b0, b1] = band[imgCol];
+      th = Math.min(124 * u, (b1 - b0) * 0.5) * st.imageScale;
+      tw = Math.min(160 * u * st.imageScale, (th * iv.W) / iv.H);
+      th = (tw * iv.H) / iv.W;
+      const stack = (w: number) => (iv.frames > 1 ? (Math.min(w / 3 - 4 * u, 44 * u) * iv.H) / iv.W + 3 * u + 24 * u : 0);
+      const room = b1 - b0 + 2 * 11 * u;
+      if (th + stack(tw) > room) {
+        const k = room / (th + stack(tw));
+        tw *= k;
+        th *= k;
+      }
+      stackH = stack(tw);
+      const lw = measure(this.labels.inputs[cols[imgCol].base ?? 0] ?? "image", font(600, st.labelSize * u));
+      labelW = Math.max(labelW, lw + 14 * u + 3 * u + tw);
+    }
+    const isz = 22 * u * this.fonts.ls;
+    let outW = 0;
+    const probs = st.showProbs && (this.viz.mode === "continuous" || outCol.sel.length <= 8);
+    const probW = probs ? measure(this.viz.mode === "categorical" ? "100%" : "−0.00", font(400, (st.valueSize - 2) * u, true)) : 0;
+    for (const unit of outCol.sel) {
+      const label = this.labels.outputs[unit] ?? `out ${unit}`;
+      const pill = (this.labels.icons[unit] ? isz + 8 * u : 0) + measure(label, font(700, this.fonts.out)) + 16 * u;
+      outW = Math.max(outW, r + 4.5 * u + 11.5 * u + pill + (probs ? 4 * u + probW : 0));
+    }
+
+    // ---- horizontal: columns share what is left, never closer than their nodes need
+    const halfR = new Array(stages).fill(0);
+    const halfL = new Array(stages).fill(0);
+    cols.forEach((c, ci) => {
+      const hw = c.image ? 2 * u : isMap(c) ? this.mapSize / 2 + 2 * u : ci === outCi ? r + 4.5 * u : r;
+      halfR[c.stage] = Math.max(halfR[c.stage], hw);
+      halfL[c.stage] = Math.max(halfL[c.stage], c.image ? 0 : hw);
+    });
+    const minSp = Array.from({ length: Math.max(0, stages - 1) }, (_, i) => halfR[i] + halfL[i + 1] + 30 * u);
+    const sumMin = minSp.reduce((a, b) => a + b, 0);
+    this.textX = leftEdge;
+    const leftX = leftEdge + labelW;
+    const rightX = rightEdge - outW;
+    const avail = rightX - leftX;
+    const need = leftEdge + labelW + sumMin + outW + (W - rightEdge);
+    const span = Math.max(sumMin, Math.min(avail, avail * st.colSpacing));
+    // even spacing where possible; a pair that needs more than the even share keeps its minimum
+    let lam = minSp.length ? span / minSp.length : 0;
+    for (let it = 0; it < minSp.length; it++) {
+      const fixed = minSp.filter((x) => x > lam);
+      const nl = minSp.length - fixed.length;
+      const next = nl ? (span - fixed.reduce((a, b) => a + b, 0)) / nl : lam;
+      if (Math.abs(next - lam) < 1e-6) break;
+      lam = next;
+    }
+    const xs = [leftX + Math.max(0, avail - span) / 2];
+    for (let i = 0; i < minSp.length; i++) xs.push(xs[i] + Math.max(minSp[i], lam));
+    this.X = cols.map((c) => xs[c.stage]);
+    this.half = cols.map((c, ci) => (c.image ? 2 * u : isMap(c) ? this.mapSize / 2 : ci === outCi ? r : r));
+    this.titleLo = leftEdge > m ? leftEdge : 6 * s;
+    this.titleHi = rightEdge < W - m ? rightEdge : W - 6 * s;
+    this.imgRect = imgCol >= 0 && o.image ? [this.X[imgCol] - tw, 0, tw, th] : null;
+    this.titleBoxes = st.titles ? this.placeTitles(ctx, u) : [];
+    // a second title row below the first pushes the columns down
+    const titleBottom = Math.max(this.headerY + titleRow / 2, ...this.titleBoxes.map((t) => t.y1));
+    if (titleBottom + 26 * u > top) {
+      top = titleBottom + 26 * u;
+      vertical(top);
+    }
+
+    // ---- rows
+    const halfV = (c: VizColumn, ci: number) => (isMap(c) ? this.mapSize / 2 + 2 * u : ci === outCi ? Math.max(r + 4.5 * u, 15 * u * this.fonts.ls) : vecInputs.includes(ci) ? Math.max(r, fsIn * 0.6) : r);
+    this.Y = cols.map((c, ci) => {
       const n = c.sel.length;
-      const p = (c.kind === "hidden" ? pitch : Math.min(pitch * 1.25, (bot - top) / Math.max(1, n - 1), 56 * s)) * st.rowSpacing;
-      const span = p * (n - 1);
-      const y0 = (top + bot) / 2 - span / 2;
+      const [b0, b1] = band[ci];
+      const hv = halfV(c, ci);
+      const pp = Math.min(p[ci], n > 1 ? (b1 - b0 - 2 * hv) / (n - 1) : Infinity);
+      const span = pp * (n - 1);
+      const y0 = (b0 + b1) / 2 - span / 2;
       const ys = new Array(n);
-      c.order.forEach((ii, slot) => (ys[ii] = y0 + slot * p));
+      c.order.forEach((ii, slot) => (ys[ii] = y0 + slot * pp));
       return ys;
     });
     if (this.imgRect) {
-      const [, , tw, th] = this.imgRect;
-      this.imgRect = [this.X[0] - tw, this.Y[0][0] - th / 2, tw, th];
+      const [b0, b1] = band[imgCol];
+      let y = this.Y[imgCol][0] - th / 2;
+      y = Math.max(b0 - 11 * u + 3 * u, Math.min(y, b1 + 11 * u - th - stackH));
+      this.imgRect[1] = y;
+      this.Y[imgCol][0] = y + th / 2;
     }
-    return s;
+
+    // ---- boxes, for overlap checks
+    for (const t of this.titleBoxes) boxes.push({ kind: `title ${t.text}`, x0: t.x0, y0: t.y0, x1: t.x1, y1: t.y1 });
+    cols.forEach((c, ci) => {
+      if (c.image) return;
+      const ys = this.Y[ci];
+      const hv = isMap(c) ? this.mapSize / 2 + 2 * u : ci === outCi ? r + 4.5 * u : r;
+      const hw = isMap(c) ? this.mapSize / 2 + 2 * u : ci === outCi ? r + 4.5 * u : r;
+      boxes.push({ kind: `column ${ci}`, x0: this.X[ci] - hw, x1: this.X[ci] + hw, y0: Math.min(...ys) - hv, y1: Math.max(...ys) + hv });
+    });
+    for (const ci of vecInputs) {
+      const c = cols[ci];
+      const vw = st.showValues ? measure(this.valueText(ci), font(400, fsVal, true)) : 0;
+      c.sel.forEach((unit, ii) => {
+        const y = this.Y[ci][ii];
+        const lw = measure(this.inputLabel(c, unit), font(600, fsIn));
+        boxes.push({ kind: `input label ${ci}:${unit}`, x0: this.textX, x1: this.textX + lw, y0: y - fsIn * 0.45, y1: y + fsIn * 0.45 });
+        const xv = this.X[ci] - r - 12 * u;
+        if (vw) boxes.push({ kind: `input value ${ci}:${unit}`, x0: xv - vw, x1: xv, y0: y - fsVal * 0.45, y1: y + fsVal * 0.45 });
+      });
+    }
+    if (this.imgRect) {
+      const [x, y, w, h] = this.imgRect;
+      const b = 3 * u;
+      boxes.push({ kind: "image node", x0: x - b, y0: y - b, x1: x + w + b, y1: y + h + b + stackH });
+      const lw = measure(this.labels.inputs[cols[imgCol].base ?? 0] ?? "image", font(600, st.labelSize * u));
+      boxes.push({ kind: "image label", x0: x - b - 14 * u - lw, x1: x - b - 14 * u, y0: y + h / 2 - st.labelSize * u * 0.45, y1: y + h / 2 + st.labelSize * u * 0.45 });
+    }
+    outCol.sel.forEach((unit, ii) => {
+      const y = this.Y[outCi][ii];
+      const label = this.labels.outputs[unit] ?? `out ${unit}`;
+      const pill = (this.labels.icons[unit] ? isz + 8 * u : 0) + measure(label, font(700, this.fonts.out)) + 16 * u;
+      const ix = this.X[outCi] + r + 16 * u;
+      boxes.push({ kind: `output label ${unit}`, x0: ix - 6 * u, x1: ix - 6 * u + pill + (probs ? 10 * u + probW : 0), y0: y - 15 * u * this.fonts.ls, y1: y + 15 * u * this.fonts.ls });
+    });
+    this.boxes = boxes;
+    return need;
+  }
+
+  /** name of unit `unit` of input column c */
+  private inputLabel(c: VizColumn, unit: number) {
+    return this.labels.inputs[(c.base ?? 0) + unit] ?? `in ${unit}`;
+  }
+
+  /** the widest value readout of an input column, as a monospace pattern (so it is measured once) */
+  private valueText(ci: number) {
+    let t = this.valuePattern.get(ci);
+    if (t === undefined) {
+      const c = this.viz.cols[ci];
+      let big = 0;
+      for (const x of c.raw ?? []) big = Math.max(big, Math.abs(x));
+      const unitW = Math.max(0, ...c.sel.map((unit) => (this.labels.units[(c.base ?? 0) + unit] ?? "").length));
+      t = (big >= 1000 ? "−0.0e+0" : big >= 100 ? "−000" : "−00.0".slice(big >= 10 ? 0 : 1) + "0") + (unitW ? " " + "0".repeat(unitW) : "");
+      this.valuePattern.set(ci, t);
+    }
+    return t;
   }
 
   /**
@@ -331,16 +576,26 @@ export class Renderer {
    * first nudge them apart (as little as possible, least squares), then alternate them over two rows if a nudge
    * exceeds 20 px, then shrink the font,
    * and finally cut the longest ones with "…". Sets ctx.font to the chosen size.
+   * Columns that share a stage (one per branch) share one title.
    */
   private placeTitles(ctx: CanvasRenderingContext2D, s: number): TitleBox[] {
-    const W = this.opt.width;
-    const items = this.viz.cols
-      // kept in column order, even when squeezed columns cross: the titles then still read input -> output
-      .map((c, ci) => ({ text: c.label, cx: this.X[ci] + (c.kind === "output" ? 40 * s : ci === 0 && this.imgRect ? -this.imgRect[2] / 2 : 0) }));
+    const cols = this.viz.cols;
+    const byStage = new Map<number, { texts: string[]; cx: number }>();
+    cols.forEach((c, ci) => {
+      const cx = this.X[ci] + (c.kind === "output" ? 40 * s : c.image && this.imgRect ? -this.imgRect[2] / 2 : 0);
+      const e = byStage.get(c.stage);
+      if (!e) byStage.set(c.stage, { texts: [c.label], cx });
+      else {
+        if (!e.texts.includes(c.label)) e.texts.push(c.label);
+        if (c.image) e.cx = cx;
+      }
+    });
+    // kept in column order, even when squeezed columns cross: the titles then still read input -> output
+    const items = [...byStage.entries()].sort((a, b) => a[0] - b[0]).map(([, e]) => ({ text: e.texts.join(" + "), cx: e.cx }));
     if (!items.length) return [];
     const gap = 14 * s;
-    const lo = 6 * s, hi = W - 6 * s;
-    const font = (px: number) => `500 ${px}px "Public Sans", system-ui, sans-serif`;
+    const lo = this.titleLo, hi = this.titleHi;
+    const font = (px: number) => `500 ${px}px ${SANS}`;
     const f0 = 15 * s;
     // how far a layout moves titles off their columns (0 = all centred, no overlap)
     const solve = (px: number, rows: number) => {
@@ -418,7 +673,8 @@ export class Renderer {
     const T = viz.T;
     const tickF = Math.max(0, tRec * o.hz);
     const k = Math.min(T - 1, Math.floor(tickF));
-    const s = this.layout();
+    ctx.save();
+    const s = this.layout(ctx);
     const W = o.width, H = o.height;
     const st = o.style;
     const C = { off: hex(th.off), on: hex(th.on), pos: hex(st.pos || th.pos), neg: hex(st.neg || th.neg), bg: hex(st.bg || th.bg), text: hex(th.text), dim: hex(th.dim), pulse: hex(th.pulse) };
@@ -435,37 +691,32 @@ export class Renderer {
     this.lastTick = k;
     const E = this.ease;
 
-    ctx.save();
     ctx.clearRect(0, 0, W, H);
     if (!o.transparent) {
       ctx.fillStyle = st.bg || th.bg;
       ctx.fillRect(0, 0, W, H);
     }
 
-    // column headings
-    ctx.textAlign = "left";
-    ctx.textBaseline = "middle";
-    ctx.fillStyle = th.dim;
-    this.titleBoxes = st.titles ? this.placeTitles(ctx, s) : [];
-    for (const t of this.titleBoxes) ctx.fillText(t.text, t.x0, t.y);
-
     // pulse: sweep once per decision tick, or once per m ticks when ticks come faster than ~4 frames
     const ticksPerSec = o.hz * o.speed;
     const m = Math.max(1, Math.ceil((ticksPerSec * 4) / o.fps));
     const ph = (tickF / m) % 1;
     const nc = viz.cols.length;
-    for (let ci = this.imgRect ? 1 : 0; ci < nc; ci++) {
-      const g = Math.exp(-((ph * (nc + 1) - ci - 0.5) ** 2) / 0.35);
-      if (g < 0.05) continue;
-      const x = this.X[ci];
-      const ys = this.Y[ci];
-      const yTop = Math.min(...ys) - 22 * s;
-      const yBot = Math.max(...ys) + 22 * s;
-      if (!st.pulse) break;
-      ctx.fillStyle = rgba(C.pulse, 0.06 * g * st.pulseIntensity);
-      roundRect(ctx, x - 20 * s, yTop, 40 * s, yBot - yTop, 14 * s);
-      ctx.fill();
-    }
+    const ns = viz.stages;
+    if (st.pulse)
+      for (let ci = 0; ci < nc; ci++) {
+        const col = viz.cols[ci];
+        if (col.image) continue;
+        const g = Math.exp(-((ph * (ns + 1) - col.stage - 0.5) ** 2) / 0.35);
+        if (g < 0.05) continue;
+        const x = this.X[ci];
+        const ys = this.Y[ci];
+        const yTop = Math.min(...ys) - 22 * s;
+        const yBot = Math.max(...ys) + 22 * s;
+        ctx.fillStyle = rgba(C.pulse, 0.06 * g * st.pulseIntensity);
+        roundRect(ctx, x - 20 * s, yTop, 40 * s, yBot - yTop, 14 * s);
+        ctx.fill();
+      }
 
     // edges
     ctx.lineCap = "round";
@@ -483,10 +734,10 @@ export class Renderer {
         const idx = topK(row, kk);
         for (const i of idx) {
           const v = row[i];
-          const st = Math.min(Math.abs(v) / e.scale, 1);
-          if (st < 0.06) continue;
-          ctx.strokeStyle = rgba(v > 0 ? C.pos : C.neg, 0.12 + 0.68 * st);
-          ctx.lineWidth = (o.style.edgeMin + (o.style.edgeMax - o.style.edgeMin) * st) * s;
+          const str = Math.min(Math.abs(v) / e.scale, 1);
+          if (str < 0.06) continue;
+          ctx.strokeStyle = rgba(v > 0 ? C.pos : C.neg, 0.12 + 0.68 * str);
+          ctx.lineWidth = (st.edgeMin + (st.edgeMax - st.edgeMin) * str) * s;
           ctx.beginPath();
           const y0 = this.Y[e.from][i];
           const y1 = this.Y[e.to][j];
@@ -499,47 +750,54 @@ export class Renderer {
     }
 
     // pictures: recording render and what the AI sees, each with a caption
-    const drawPics = (corner: boolean) => {
-     for (const p of this.pics) {
-      if (p.corner !== corner) continue;
-      ctx.font = `500 ${15 * s}px "Public Sans", system-ui, sans-serif`;
+    for (const p of this.pics) {
+      ctx.font = `500 ${p.capPx}px ${SANS}`;
       ctx.textAlign = "left";
       ctx.textBaseline = "alphabetic";
       ctx.fillStyle = th.dim;
       ctx.fillText(p.caption, p.x, p.y - 10 * s);
       if (p.kind === "rec") this.blitRecording(ctx, k, p.x, p.y, p.w, p.h);
       else this.blitInput(ctx, k, 0, p.x, p.y, p.w, p.h);
-     }
-    };
-    drawPics(false);
-    ctx.textBaseline = "middle";
+    }
 
-    // input column
-    const inCol = viz.cols[0];
-    const xIn = this.X[0];
-    const labX = this.textX;
+    // column headings, after the pictures so a title is never hidden under one
+    ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    if (this.imgRect) this.drawImageNode(ctx, k, E[0][0], C, s);
-    else inCol.sel.forEach((unit, ii) => {
-      const y = this.Y[0][ii];
-      ctx.textAlign = "left";
-      ctx.fillStyle = th.text;
-      ctx.font = `600 ${st.labelSize * s}px "Public Sans", system-ui, sans-serif`;
-      ctx.fillText(this.labels.inputs[unit] ?? `in ${unit}`, labX, y);
-      if (st.showValues) {
-        const raw = inCol.raw![k * inCol.sel.length + ii];
-        ctx.textAlign = "right";
-        ctx.fillStyle = th.dim;
-        ctx.font = `400 ${st.valueSize * s}px "JetBrains Mono", ui-monospace, monospace`;
-        const u = this.labels.units[unit];
-        ctx.fillText(fmt(raw) + (u ? ` ${u}` : ""), xIn - this.r - 12 * s, y);
+    ctx.fillStyle = th.dim;
+    if (this.titleBoxes.length) ctx.font = `500 ${this.titleBoxes[0].y1 - this.titleBoxes[0].y0}px ${SANS}`;
+    for (const t of this.titleBoxes) ctx.fillText(t.text, t.x0, t.y);
+
+    // input columns: an image node, or one labelled row per number
+    for (let ci = 0; ci < nc; ci++) {
+      const inCol = viz.cols[ci];
+      if (inCol.kind !== "input") continue;
+      if (inCol.image) {
+        if (this.imgRect) this.drawImageNode(ctx, k, E[ci][0], C, s, this.labels.inputs[inCol.base ?? 0] ?? "image");
+        continue;
       }
-      this.node(ctx, xIn, y, E[0][ii], C, s, false, 0);
-    });
+      const xIn = this.X[ci];
+      inCol.sel.forEach((unit, ii) => {
+        const y = this.Y[ci][ii];
+        ctx.textAlign = "left";
+        ctx.fillStyle = th.text;
+        ctx.font = `600 ${this.fonts.inLabel}px ${SANS}`;
+        ctx.fillText(this.inputLabel(inCol, unit), this.textX, y);
+        if (st.showValues) {
+          const raw = inCol.raw![k * inCol.sel.length + ii];
+          ctx.textAlign = "right";
+          ctx.fillStyle = th.dim;
+          ctx.font = `400 ${this.fonts.inValue}px ${MONO}`;
+          const un = this.labels.units[(inCol.base ?? 0) + unit];
+          ctx.fillText(fmt(raw) + (un ? ` ${un}` : ""), xIn - this.r - 12 * s, y);
+        }
+        this.node(ctx, xIn, y, E[ci][ii], C, s, false, 0);
+      });
+    }
 
     // hidden columns
-    for (let ci = 1; ci < nc - 1; ci++) {
+    for (let ci = 0; ci < nc; ci++) {
       const col = viz.cols[ci];
+      if (col.kind !== "hidden") continue;
       const maps = o.showMaps ? col.maps : undefined;
       col.sel.forEach((_, ii) => (maps ? this.mapNode(ctx, k, col, ii, this.X[ci], this.Y[ci][ii], E[ci][ii], C, s) : this.node(ctx, this.X[ci], this.Y[ci][ii], E[ci][ii], C, s, false, 0)));
     }
@@ -548,17 +806,17 @@ export class Renderer {
     const outCol = viz.cols[nc - 1];
     const xo = this.X[nc - 1];
     const ch = viz.chosen ? viz.chosen[k] : -1;
+    const ls = this.fonts.ls;
     outCol.sel.forEach((unit, ii) => {
       const y = this.Y[nc - 1][ii];
       const p = E[nc - 1][ii];
       const isChosen = unit === ch;
       this.node(ctx, xo, y, p, C, s, isChosen, p);
       const ix = xo + this.r + 16 * s;
-      const isz = 22 * s * ((st.labelSize - 1) / 16);
+      const isz = 22 * s * ls;
       const icon = this.labels.icons[unit];
       const label = this.labels.outputs[unit] ?? `out ${unit}`;
-      const ls = (st.labelSize - 1) / 16;
-      ctx.font = `${isChosen ? 700 : 500} ${(st.labelSize - 1) * s}px "Public Sans", system-ui, sans-serif`;
+      ctx.font = `${isChosen ? 700 : 500} ${this.fonts.out}px ${SANS}`;
       const tw = ctx.measureText(label).width;
       const pillW = (icon ? isz + 8 * s : 0) + tw + 16 * s;
       if (isChosen) {
@@ -576,13 +834,12 @@ export class Renderer {
       ctx.fillStyle = isChosen ? th.bg : th.text;
       ctx.fillText(label, tx, y + 0.5 * s);
       if (st.showProbs && (viz.mode === "continuous" || outCol.sel.length <= 8)) {
-        ctx.font = `400 ${(st.valueSize - 2) * s}px "JetBrains Mono", ui-monospace, monospace`;
+        ctx.font = `400 ${(st.valueSize - 2) * s}px ${MONO}`;
         ctx.fillStyle = th.dim;
         const val = viz.mode === "categorical" ? `${Math.round(outCol.raw![k * outCol.sel.length + ii] * 100)}%` : fmt(outCol.raw![k * outCol.sel.length + ii]);
         ctx.fillText(val, ix + pillW + 4 * s, y + 0.5 * s);
       }
     });
-    drawPics(true);
     ctx.restore();
   }
 
@@ -653,7 +910,7 @@ export class Renderer {
   }
 
   /** the input column of an image model: current frame, border lit by how much it changed, older stack frames below */
-  private drawImageNode(ctx: CanvasRenderingContext2D, k: number, v: number, C: Record<string, RGB>, s: number) {
+  private drawImageNode(ctx: CanvasRenderingContext2D, k: number, v: number, C: Record<string, RGB>, s: number, label: string) {
     const [x, y, w, h] = this.imgRect!;
     const iv = this.opt.image!;
     const b = 3 * s;
@@ -668,7 +925,7 @@ export class Renderer {
     ctx.textAlign = "right";
     ctx.fillStyle = this.opt.theme.text;
     ctx.font = `600 ${this.opt.style.labelSize * s}px "Public Sans", system-ui, sans-serif`;
-    ctx.fillText(this.labels.inputs[0] ?? "image", x - b - 14 * s, y + h / 2);
+    ctx.fillText(label, x - b - 14 * s, y + h / 2);
     // older frames of the stack, newest first, small and dimmer
     const older = Math.min(iv.frames - 1, 3);
     if (older > 0) {
@@ -734,14 +991,14 @@ export class Renderer {
 
   /** which input/output row is under (x, y) in canvas pixels */
   hit(x: number, y: number): Hit | null {
-    const nc = this.viz.cols.length;
-    const s = this.opt.height / 720;
-    for (const col of [0, nc - 1]) {
+    const s = this.u;
+    for (let col = 0; col < this.viz.cols.length; col++) {
+      const c = this.viz.cols[col];
+      if (!((c.kind === "input" && !c.image) || c.kind === "output")) continue;
       const xc = this.X[col];
-      const inBand = col === 0 ? x < xc + 30 * s : x > xc - 30 * s;
+      const inBand = c.kind === "input" ? x < xc + 30 * s && x > this.textX - 10 * s : x > xc - 30 * s;
       if (!inBand) continue;
       const ys = this.Y[col];
-      const c = this.viz.cols[col];
       for (let slot = 0; slot < c.order.length; slot++) {
         const yy = ys[c.order[slot]];
         const half = ys.length > 1 ? Math.abs(ys[c.order[1]] - ys[c.order[0]]) / 2 : 20 * s;

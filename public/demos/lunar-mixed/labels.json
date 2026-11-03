@@ -1,0 +1,35 @@
+{
+  "title": "LunarLander · pixels + numbers",
+  "description": "Two inputs: the last two 64x64 grayscale frames (through a small conv stack) and 6 plain numbers (x/y speed, angle, spin, leg contacts), concatenated into a dense head. Decides every 4 physics ticks (12.5 Hz). Taught by imitating the PPO expert (behaviour cloning + DAgger).",
+  "inputs": [
+    "camera",
+    "x speed",
+    "y speed",
+    "angle",
+    "spin",
+    "left leg",
+    "right leg"
+  ],
+  "outputs": [
+    "nothing",
+    "left engine",
+    "main engine",
+    "right engine"
+  ],
+  "icons": [
+    "icons/noop.svg",
+    "icons/left.svg",
+    "icons/main.svg",
+    "icons/right.svg"
+  ],
+  "output_mode": "categorical",
+  "input_units": [
+    null,
+    "",
+    "",
+    "rad",
+    "",
+    "0/1",
+    "0/1"
+  ]
+}

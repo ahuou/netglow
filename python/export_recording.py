@@ -48,9 +48,9 @@ from torch import nn
 
 def export_onnx(
     module: nn.Module,
-    example_input: torch.Tensor,
+    example_input: torch.Tensor | tuple,
     path: str,
-    input_name: str = "obs",
+    input_name: str | Sequence[str] = "obs",
     output_name: str = "logits",
     opset: int = 17,
 ) -> str:
@@ -58,17 +58,22 @@ def export_onnx(
 
     Uses the legacy TorchScript exporter (``dynamo=False``) so nn.Linear maps to a
     Gemm node, with a dynamic batch axis 0 and all weights embedded in the file.
+    Several inputs (e.g. frames + a vector): pass a tuple of example tensors and a
+    list of names, in the order ``module.forward`` takes them.
     """
     module = module.eval().cpu()
+    examples = tuple(x.cpu() for x in example_input) if isinstance(example_input, tuple) else (example_input.cpu(),)
+    names = [input_name] if isinstance(input_name, str) else list(input_name)
+    assert len(names) == len(examples), "one input name per example tensor"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with torch.no_grad():
         torch.onnx.export(
             module,
-            (example_input.cpu(),),
+            examples,
             path,
-            input_names=[input_name],
+            input_names=names,
             output_names=[output_name],
-            dynamic_axes={input_name: {0: "N"}, output_name: {0: "N"}},
+            dynamic_axes={**{n: {0: "N"} for n in names}, output_name: {0: "N"}},
             opset_version=opset,
             do_constant_folding=True,
             dynamo=False,
@@ -115,17 +120,20 @@ def sb3_actor(model) -> nn.Module:
     return _SB3Actor(model.policy).eval().cpu()
 
 
-def verify_onnx(path: str, module: nn.Module, obs: np.ndarray, input_name: str = "obs") -> dict:
-    """Run ``obs`` through onnxruntime (CPU) and torch; print and return the agreement."""
+def verify_onnx(path: str, module: nn.Module, obs: np.ndarray | dict, input_name: str = "obs") -> dict:
+    """Run ``obs`` through onnxruntime (CPU) and torch; print and return the agreement.
+    Several inputs: pass ``obs`` as {input name: array}, in the order ``module.forward`` takes them."""
     import onnxruntime as ort
 
+    feeds = obs if isinstance(obs, dict) else {input_name: obs}
     sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-    onnx_out = sess.run(None, {input_name: obs})[0]
+    onnx_out = sess.run(None, feeds)[0]
     with torch.no_grad():
-        torch_out = module.eval().cpu()(torch.as_tensor(obs)).numpy()
+        torch_out = module.eval().cpu()(*[torch.as_tensor(v) for v in feeds.values()]).numpy()
     diff = float(np.abs(onnx_out - torch_out).max())
     agree = float((onnx_out.argmax(-1) == torch_out.argmax(-1)).mean())
-    print(f"[verify] {os.path.basename(path)}: max|onnx-torch| = {diff:.3g}, argmax agreement = {agree * 100:.2f}% over {len(obs)} ticks")
+    T = len(next(iter(feeds.values())))
+    print(f"[verify] {os.path.basename(path)}: max|onnx-torch| = {diff:.3g}, argmax agreement = {agree * 100:.2f}% over {T} ticks")
     return {"max_abs_diff": diff, "argmax_agreement": agree}
 
 
@@ -161,7 +169,7 @@ def record_episode(
     total, terminated = 0.0, False
     for _ in range(max_steps):
         action, outputs = policy_fn(obs)
-        rec["obs"].append(np.array(obs, copy=True))
+        rec["obs"].append(tuple(np.array(o, copy=True) for o in obs) if isinstance(obs, tuple) else np.array(obs, copy=True))
         rec["actions"].append(action)
         rec["outputs"].append(outputs)
         if render:
@@ -170,8 +178,10 @@ def record_episode(
         total += float(reward)
         if terminated or truncated:
             break
+    obs_list = rec["obs"]
     out = {
-        "obs": np.stack(rec["obs"]),
+        # several inputs (obs is a tuple per tick): a tuple of stacked arrays
+        "obs": tuple(np.stack(x) for x in zip(*obs_list)) if isinstance(obs_list[0], tuple) else np.stack(obs_list),
         "actions": np.asarray(rec["actions"]),
         "outputs": None if rec["outputs"][0] is None else np.stack(rec["outputs"]).astype(np.float32),
         "frames": np.stack(rec["frames"]) if render else None,
@@ -183,7 +193,7 @@ def record_episode(
 
 def save_recording(
     path: str,
-    obs: np.ndarray,
+    obs: np.ndarray | dict,
     actions: np.ndarray | None = None,
     outputs: np.ndarray | None = None,
     t: np.ndarray | None = None,
@@ -195,7 +205,10 @@ def save_recording(
 ) -> str:
     """Write the netglow recording format (np.savez_compressed, no pickled objects).
 
-    obs      (T, *input_shape) in the ONNX input dtype -- required
+    obs      (T, *input_shape) in the ONNX input dtype -- required. A model with
+             several inputs takes a dict {ONNX input name: (T, *shape)}; each
+             array is stored as ``obs_<name>`` (a plain ``obs`` stays the
+             single-input format, so old recordings keep working)
     actions  int64 (T,) discrete, or float32 (T, A) continuous
     outputs  float32 (T, n_out) raw model outputs at record time
     t        float64 (T,) seconds since episode start (defaults to tick / fps)
@@ -203,9 +216,13 @@ def save_recording(
     frames   uint8 (T, H, W, 3) renders for context
     input_names / output_names  unicode string arrays
     """
-    obs = np.asarray(obs)
-    T = len(obs)
-    arrays = {"obs": obs}
+    if isinstance(obs, dict):
+        arrays = {f"obs_{k}": np.asarray(v) for k, v in obs.items()}
+        T = len(next(iter(arrays.values())))
+    else:
+        obs = np.asarray(obs)
+        T = len(obs)
+        arrays = {"obs": obs}
     if actions is not None:
         a = np.asarray(actions)
         arrays["actions"] = a.astype(np.int64) if np.issubdtype(a.dtype, np.integer) else a.astype(np.float32)

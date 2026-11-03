@@ -33,6 +33,7 @@ interface LabelsFile {
 const DEMOS = [
   { id: "lunar-mlp", title: "LunarLander, MLP", sub: "PPO policy reading 8 numbers" },
   { id: "lunar-cnn", title: "LunarLander, CNN", sub: "a CNN pilot that flies from pixels" },
+  { id: "lunar-mixed", title: "LunarLander, pixels + numbers", sub: "two inputs: frames and 6 plain numbers" },
 ];
 
 const S = {
@@ -42,7 +43,10 @@ const S = {
   plan: null as Plan | null,
   rec: null as Map<string, NdArray> | null,
   recName: "",
+  /** the input shown as a picture (the image input, else the first one) */
   obs: null as NdArray | null,
+  /** one recording array per model input, in plan.inputs order */
+  obsList: [] as NdArray[],
   labelsFile: null as LabelsFile | null,
   iconFiles: new Map<string, HTMLImageElement>(), // by lowercased basename without extension
   iconOverride: new Map<number, HTMLImageElement>(),
@@ -112,10 +116,12 @@ async function loadRecording(bytes: Uint8Array, name: string) {
   if (name.endsWith(".npz") || (bytes[0] === 0x50 && bytes[1] === 0x4b)) rec = await parseNpz(bytes);
   else if (name.endsWith(".npy")) rec = new Map([["obs", parseNpy(bytes)]]);
   else rec = parseJsonRecording(new TextDecoder().decode(bytes));
-  const obs = rec.get("obs") ?? rec.get("inputs") ?? (S.plan ? rec.get(S.plan.inputName) : undefined);
-  if (!obs) throw new Error(`The recording needs an "obs" array (one row per tick). Found: ${[...rec.keys()].join(", ") || "nothing"}.`);
+  const keys = [...rec.keys()];
+  if (!rec.has("obs") && !rec.has("inputs") && !keys.some((k) => k.startsWith("obs_")) && !(S.plan && S.plan.inputs.every((i) => rec.has(i.name))))
+    throw new Error(`The recording needs an "obs" array (one row per tick), or one "obs_<input name>" array per model input. Found: ${keys.join(", ") || "nothing"}.`);
   S.rec = rec;
-  S.obs = obs;
+  S.obs = null;
+  S.obsList = [];
   S.recName = name;
   markFile("recording", name);
   const fps = rec.get("fps");
@@ -128,6 +134,17 @@ async function loadRecording(bytes: Uint8Array, name: string) {
   }
   ($("hz") as HTMLInputElement).value = String(+S.hz.toFixed(3));
   S.t = 0;
+}
+
+/** the recording array for each model input: obs_<name>, then <name>, then plain obs for a single-input model */
+function resolveObs(plan: Plan, rec: Map<string, NdArray>): NdArray[] {
+  const one = plan.inputs.length === 1;
+  return plan.inputs.map((inp) => {
+    const a = rec.get(`obs_${inp.name}`) ?? rec.get(inp.name) ?? (one ? (rec.get("obs") ?? rec.get("inputs")) : undefined);
+    if (!a)
+      throw new Error(`The model has ${plan.inputs.length} inputs (${plan.inputs.map((i) => i.name).join(", ")}); the recording needs an "obs_${inp.name}" array. Found: ${[...rec.keys()].join(", ")}.`);
+    return a;
+  });
 }
 
 function markFile(kind: string, name: string) {
@@ -162,7 +179,7 @@ async function handleFiles(files: File[]) {
     for (const f of jsons) {
       const text = await f.text();
       const j = JSON.parse(text);
-      if (Array.isArray(j.obs) || Array.isArray(j.inputs?.[0])) recs.push(f);
+      if (Array.isArray(j.obs) || Array.isArray(j.inputs?.[0]) || Object.keys(j).some((k) => k.startsWith("obs_"))) recs.push(f);
       else {
         S.labelsFile = j;
         markFile("labels", f.name + (icons.length ? ` + ${icons.length} icons` : ""));
@@ -228,12 +245,15 @@ async function rebuild(rerun: boolean) {
     else if (S.rec) status("Recording loaded. Now drop the ONNX model.");
     return;
   }
-  if (!S.rec || !S.obs) {
+  if (!S.rec) {
     status(`Model loaded: ${S.plan.layers.length} weighted layers. Now drop a recording.`);
     $("docTitle").textContent = S.labelsFile?.title ?? S.modelName;
     return;
   }
   if (rerun || !S.trace) {
+    S.obsList = resolveObs(S.plan, S.rec);
+    const imgIdx = S.plan.inputs.findIndex((i) => i.isImage);
+    S.obs = S.obsList[Math.max(0, imgIdx)];
     if (!S.modeTouched) {
       const lf = S.labelsFile?.output_mode;
       const acts = S.rec.get("actions");
@@ -242,11 +262,11 @@ async function rebuild(rerun: boolean) {
       ($("mode") as HTMLSelectElement).value = S.mode;
     }
     busy(true, "Running the model in this tab…", 0);
-    S.trace = await runTrace(S.model, S.plan, S.obs, (f) => busy(true, "Running the model in this tab…", f));
+    S.trace = await runTrace(S.model, S.plan, S.obsList, (f) => busy(true, "Running the model in this tab…", f));
     busy(false);
   }
-  const prev = S.viz ? { input: S.viz.cols[0].order, output: S.viz.cols[S.viz.cols.length - 1].order } : undefined;
-  S.viz = buildViz(S.plan, S.trace, S.rec, S.obs, { nodesPerColumn: S.nodes, maxInputs: 24, mode: S.mode }, rerun ? undefined : prev);
+  const prev = S.viz ? { inputs: S.viz.cols.filter((c) => c.kind === "input").map((c) => c.order), output: S.viz.cols[S.viz.cols.length - 1].order } : undefined;
+  S.viz = buildViz(S.plan, S.trace, S.rec, S.obsList, { nodesPerColumn: S.nodes, maxInputs: 24, mode: S.mode }, rerun ? undefined : prev);
   S.labels = resolveLabels();
   makeRenderer();
   const warn = S.plan.warnings.length ? ` Note: ${S.plan.warnings.join(" ")}` : "";
@@ -275,13 +295,22 @@ function resolveLabels(): Labels {
   const lf = S.labelsFile ?? {};
   const rec = S.rec!;
   const viz = S.viz!;
-  const nIn = viz.cols[0].n;
   const nOut = viz.cols[viz.cols.length - 1].n;
   const recIn = rec.get("input_names")?.strings;
   const recOut = rec.get("output_names")?.strings;
-  const inputs = viz.imageInput
-    ? [S.nameOverride.inputs.get(0) ?? "image"]
-    : Array.from({ length: nIn }, (_, i) => S.nameOverride.inputs.get(i) ?? lf.inputs?.[i] ?? recIn?.[i] ?? `in ${i}`);
+  // one flat list of names over every model input, in model order; an image input takes one name
+  const inCols = viz.cols.filter((c) => c.kind === "input");
+  const multi = inCols.length > 1;
+  const nIn = Math.max(0, ...inCols.map((c) => (c.base ?? 0) + (c.image ? 1 : c.n)));
+  const inputs: string[] = new Array(nIn);
+  for (const c of inCols) {
+    const b = c.base ?? 0;
+    const tensor = S.plan!.inputs[c.input ?? 0].name;
+    if (c.image) inputs[b] = S.nameOverride.inputs.get(b) ?? (multi ? (lf.inputs?.[b] ?? tensor) : "image");
+    else
+      for (let i = 0; i < c.n; i++)
+        inputs[b + i] = S.nameOverride.inputs.get(b + i) ?? lf.inputs?.[b + i] ?? recIn?.[b + i] ?? (multi ? `${tensor}[${i}]` : `in ${i}`);
+  }
   const outputs = Array.from({ length: nOut }, (_, i) => S.nameOverride.outputs.get(i) ?? lf.outputs?.[i] ?? recOut?.[i] ?? `out ${i}`);
   const icons = outputs.map((name, i) => {
     const o = S.iconOverride.get(i);
@@ -316,7 +345,7 @@ function renderOpts() {
     style: S.style,
     showMaps: S.showMaps,
     frames: S.rec?.get("frames") ?? null,
-    obs: S.obs!,
+    obs: S.obs ?? S.obsList[0],
     hz: S.hz,
     speed: S.speed,
     fps: Number(($("fps") as HTMLSelectElement).value),
@@ -333,6 +362,9 @@ function makeRenderer() {
   view.width = o.width;
   view.height = o.height;
   S.renderer = new Renderer(S.viz, S.labels, o);
+  // the canvas is the picture; say in words what it shows
+  const ins = S.viz.cols.filter((c) => c.kind === "input").map((c) => (c.image ? `an image input (${S.labels!.inputs[c.base ?? 0]})` : `${c.sel.length} numbers`));
+  view.setAttribute("aria-label", `Network activation view: ${ins.join(" and ")} through ${S.viz.cols.filter((c) => c.kind === "hidden").length} hidden layers to ${S.viz.cols[S.viz.cols.length - 1].sel.length} outputs. Reorder rows with Alt + arrow keys in the Inputs and Outputs lists.`);
   $("well").classList.toggle("checker", S.transparent);
 }
 
@@ -477,13 +509,17 @@ function renderLabelsPanel() {
   const viz = S.viz!;
   const L = S.labels!;
   $("labelsSection").hidden = false;
-  const inCol = viz.cols[0];
   const inList = $("inputLabels");
-  inList.innerHTML = inCol.order
-    .map((ii) => {
-      const u = inCol.sel[ii];
-      return `<li><span class="idx">${u}</span><input type="text" data-in="${u}" value="${esc(L.inputs[u])}" aria-label="Name of input ${u}" spellcheck="false" autocomplete="off" /><span></span></li>`;
-    })
+  // every input column, in the order drawn; data-in is the name's index in labels.inputs, data-col the column
+  inList.innerHTML = viz.cols
+    .map((c, ci) => (c.kind !== "input" ? "" : c.order
+      .map((ii) => {
+        const u = c.image ? 0 : c.sel[ii];
+        const g = (c.base ?? 0) + u;
+        const shown = c.image ? "img" : String(u);
+        return `<li><span class="idx">${shown}</span><input type="text" name="input-${g}" data-in="${g}" data-col="${ci}" data-unit="${c.image ? "" : u}" value="${esc(L.inputs[g] ?? "")}" aria-label="Name of input ${esc(L.inputs[g] ?? String(g))}" spellcheck="false" autocomplete="off" /><span></span></li>`;
+      })
+      .join("")))
     .join("");
   const outCol = viz.cols[viz.cols.length - 1];
   const outList = $("outputLabels");
@@ -491,7 +527,7 @@ function renderLabelsPanel() {
     .map((ii) => {
       const u = outCol.sel[ii];
       const icon = L.icons[u];
-      return `<li><span class="idx">${u}</span><input type="text" data-out="${u}" value="${esc(L.outputs[u])}" aria-label="Name of output ${u}" spellcheck="false" autocomplete="off" />
+      return `<li><span class="idx">${u}</span><input type="text" name="output-${u}" data-out="${u}" value="${esc(L.outputs[u])}" aria-label="Name of output ${u}" spellcheck="false" autocomplete="off" />
         <label class="icon-pick" title="Set icon">${icon ? `<img src="${icon.src}" alt="" />` : `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5"/></svg>`}<input type="file" accept=".svg,.png,.jpg,.jpeg,.webp" data-icon="${u}" aria-label="Icon for output ${u}" /></label></li>`;
     })
     .join("");
@@ -499,14 +535,15 @@ function renderLabelsPanel() {
 
 // ---------- events ----------
 /** Alt + arrow in a name field moves that row: the keyboard version of dragging on the canvas */
-function keyReorder(listId: string, colOf: () => number, attr: "in" | "out") {
+function keyReorder(listId: string, colOf: (el: HTMLInputElement) => number, attr: "in" | "out") {
   $(listId).addEventListener("keydown", (e) => {
     const el = e.target as HTMLInputElement;
     if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown") || el.dataset[attr] === undefined || !S.viz) return;
+    if (attr === "in" && el.dataset.unit === "") return; // the image node is a single row
     e.preventDefault();
-    const ci = colOf();
+    const ci = colOf(el);
     const col = S.viz.cols[ci];
-    const unit = Number(el.dataset[attr]);
+    const unit = Number(attr === "in" ? el.dataset.unit : el.dataset[attr]);
     const slot = col.order.findIndex((ii) => col.sel[ii] === unit);
     const to = slot + (e.key === "ArrowUp" ? -1 : 1);
     if (to < 0 || to >= col.order.length) return;
@@ -516,10 +553,10 @@ function keyReorder(listId: string, colOf: () => number, attr: "in" | "out") {
     renderLabelsPanel();
     drawRibbon();
     redraw(0);
-    ($(listId).querySelector(`input[data-${attr}="${unit}"]`) as HTMLInputElement | null)?.focus();
+    ($(listId).querySelector(`input[data-${attr}="${el.dataset[attr]}"]`) as HTMLInputElement | null)?.focus();
   });
 }
-keyReorder("inputLabels", () => 0, "in");
+keyReorder("inputLabels", (el) => Number(el.dataset.col), "in");
 keyReorder("outputLabels", () => S.viz!.cols.length - 1, "out");
 
 $("inputLabels").addEventListener("input", (e) => {
@@ -715,7 +752,7 @@ view.addEventListener("pointermove", (e) => {
     const [it] = col.order.splice(drag.slot, 1);
     col.order.splice(to, 0, it);
     drag.slot = to;
-    if (drag.col === S.viz.cols.length - 1) orderHidden(S.viz);
+    if (S.viz.cols[drag.col].kind === "output") orderHidden(S.viz);
     redraw(0);
   }
 });

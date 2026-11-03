@@ -44,26 +44,33 @@ function makeInput(elem: number, src: NdArray, start: number, count: number, siz
   throw new Error(`Unsupported input type ${elem}`);
 }
 
-export async function runTrace(model: ModelInfo, plan: Plan, obs: NdArray, onProgress?: (f: number) => void): Promise<Trace> {
+/** obs: one recording array per model input, in plan.inputs order */
+export async function runTrace(model: ModelInfo, plan: Plan, obs: NdArray[], onProgress?: (f: number) => void): Promise<Trace> {
   const t0 = performance.now();
   const bytes = withExtraOutputs(model, plan.fetch);
   const session = await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"], graphOptimizationLevel: "disabled" });
   // optimisation is disabled so fused nodes keep the tensor names we fetch
-  const T = obs.shape[0];
-  const perTick = obs.shape.slice(1);
-  const size = perTick.reduce((a, b) => a * b, 1);
-  const want = plan.inputShape.slice(1);
-  const wantSize = want.every((d) => typeof d === "number" && d > 0) ? (want as number[]).reduce((a, b) => a * b, 1) : size;
-  if (wantSize !== size)
-    throw new Error(`Recording "obs" has ${perTick.join("×")} values per tick but the model input expects ${want.join("×")}.`);
-  const tickShape = want.every((d) => typeof d === "number" && d > 0) ? (want as number[]) : perTick;
-  const fixedBatch = typeof plan.inputShape[0] === "number" && (plan.inputShape[0] as number) > 0 ? (plan.inputShape[0] as number) : 0;
+  const T = obs[0].shape[0];
+  const fixed = (d: number | string | undefined) => (typeof d === "number" && d > 0 ? d : 0);
+  const feedsOf = plan.inputs.map((inp, i) => {
+    const o = obs[i];
+    if (o.shape[0] !== T) throw new Error(`Recording arrays disagree on the tick count: ${o.shape[0]} for "${inp.name}" vs ${T}.`);
+    const perTick = o.shape.slice(1);
+    const size = perTick.reduce((a, b) => a * b, 1);
+    const want = inp.shape.slice(1);
+    const known = want.length > 0 && want.every((d) => fixed(d) > 0);
+    const wantSize = known ? (want as number[]).reduce((a, b) => a * b, 1) : size;
+    if (wantSize !== size)
+      throw new Error(`Recording input "${inp.name}" has ${perTick.join("×")} values per tick but the model expects ${want.join("×")}.`);
+    return { inp, o, size, tickShape: known ? (want as number[]) : perTick };
+  });
+  const fixedBatch = Math.max(0, ...plan.inputs.map((i) => fixed(i.shape[0])));
   const B = fixedBatch === 1 ? 1 : fixedBatch > 1 ? -1 : 64;
   if (B < 0) throw new Error(`The model has a fixed batch size of ${fixedBatch}; export it with batch 1 or a dynamic batch axis.`);
   const tensors: Trace["tensors"] = new Map();
   for (let s = 0; s < T; s += B) {
     const c = Math.min(B, T - s);
-    const feeds = { [plan.inputName]: makeInput(plan.inputElemType, obs, s, c, size, [c, ...tickShape]) };
+    const feeds = Object.fromEntries(feedsOf.map((f) => [f.inp.name, makeInput(f.inp.elemType, f.o, s, c, f.size, [c, ...f.tickShape])]));
     const res = await session.run(feeds, plan.fetch);
     for (const name of plan.fetch) {
       const r = res[name];
