@@ -1,0 +1,9 @@
+node_modules/
+dist/
+public/ort/
+.taste-skill/
+python/.venv/
+python/runs/
+python/**/__pycache__/
+test-results/
+*.log

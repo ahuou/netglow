@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>netglow</title>
+    <meta name="description" content="Drop in a neural network and a recording of its inputs; get an animated video of its real activations. Runs entirely in your browser." />
+    <meta name="color-scheme" content="dark" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <header class="bar">
+      <a class="brand" href="./" aria-label="netglow home">
+        <svg class="mark" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+          <path d="M5 7 L12 12 L19 6 M5 17 L12 12 L19 18" stroke="currentColor" stroke-width="1.5" fill="none" opacity=".55" />
+          <circle cx="5" cy="7" r="2.2" fill="currentColor" opacity=".55" />
+          <circle cx="5" cy="17" r="2.2" fill="currentColor" opacity=".55" />
+          <circle cx="12" cy="12" r="3" fill="var(--accent)" />
+          <circle cx="19" cy="6" r="2.2" fill="currentColor" opacity=".55" />
+          <circle cx="19" cy="18" r="2.2" fill="var(--accent)" />
+        </svg>
+        <span>netglow</span>
+      </a>
+      <span class="sep" aria-hidden="true"></span>
+      <h1 id="docTitle" class="doc-title">No model loaded</h1>
+      <span id="matchPill" class="pill" hidden></span>
+      <span class="grow"></span>
+      <span class="local-note">Runs in this tab. Nothing is uploaded.</span>
+      <button id="exportTop" class="btn primary" type="button" disabled>Export</button>
+    </header>
+
+    <div class="workspace">
+      <aside class="panel left" aria-label="Files and labels">
+        <section>
+          <h2>Files</h2>
+          <div class="file-row" data-kind="model">
+            <label class="file-btn">
+              <input type="file" accept=".onnx" id="fileModel" />
+              <span class="file-kind">Model</span>
+              <span class="file-name" id="nameModel">.onnx</span>
+            </label>
+          </div>
+          <div class="file-row" data-kind="recording">
+            <label class="file-btn">
+              <input type="file" accept=".npz,.npy,.json" id="fileRec" />
+              <span class="file-kind">Recording</span>
+              <span class="file-name" id="nameRec">.npz, .npy or .json</span>
+            </label>
+          </div>
+          <div class="file-row" data-kind="labels">
+            <label class="file-btn">
+              <input type="file" accept=".json,.png,.svg,.jpg,.jpeg,.webp" id="fileLabels" multiple />
+              <span class="file-kind">Labels and icons</span>
+              <span class="file-name" id="nameLabels">optional: labels.json, .svg, .png</span>
+            </label>
+          </div>
+          <p class="hint">Or drop files anywhere on the window.</p>
+          <p id="status" class="status" role="status" aria-live="polite"></p>
+        </section>
+        <section>
+          <h2>Demos</h2>
+          <div class="demo-list" id="demoList"></div>
+        </section>
+        <section id="labelsSection" hidden>
+          <h2>Inputs</h2>
+          <ul class="label-list" id="inputLabels"></ul>
+          <h2 class="mt">Outputs</h2>
+          <ul class="label-list" id="outputLabels"></ul>
+          <p class="hint">Drag rows on the canvas to reorder them.</p>
+        </section>
+      </aside>
+
+      <main class="stage" id="stage">
+        <div class="well" id="well">
+          <canvas id="view" width="1280" height="720" aria-label="Network activation view"></canvas>
+          <div class="empty" id="empty">
+            <h2>See what your network really does</h2>
+            <p>Drop an ONNX model and a recording of its inputs. netglow runs the model in this tab and animates the real activations, tick by tick.</p>
+            <div class="empty-actions" id="emptyDemos"></div>
+          </div>
+          <div class="busy" id="busy" hidden><span id="busyText">Running the model</span><span class="busy-bar"><span id="busyFill"></span></span></div>
+        </div>
+        <div class="timeline" id="timeline">
+          <button id="play" class="icon-btn" type="button" aria-label="Play" disabled>
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path id="playIcon" d="M4 2.5v11l9-5.5z" fill="currentColor" /></svg>
+          </button>
+          <div class="scrub">
+            <canvas id="ribbon" height="40" aria-hidden="true"></canvas>
+            <input id="scrub" type="range" min="0" max="0" step="1" value="0" aria-label="Tick" disabled />
+          </div>
+          <output id="clock" class="clock num">0.00 s · tick 0 / 0</output>
+        </div>
+      </main>
+
+      <aside class="panel right" aria-label="View and export settings">
+        <section id="frameSection" hidden>
+          <h2>Recording</h2>
+          <canvas id="framePreview" class="frame-preview"></canvas>
+        </section>
+        <section>
+          <h2>Match check</h2>
+          <dl class="kv" id="matchKv">
+            <div><dt>Status</dt><dd id="matchText">Load a model and a recording</dd></div>
+          </dl>
+        </section>
+        <section>
+          <h2>View</h2>
+          <div class="field">
+            <label for="nodes">Nodes per column</label>
+            <div class="range-row"><input id="nodes" type="range" min="3" max="24" value="10" /><output for="nodes" id="nodesOut" class="num">10</output></div>
+          </div>
+          <div class="field">
+            <label for="topk">Edges per node</label>
+            <div class="range-row"><input id="topk" type="range" min="1" max="8" value="3" /><output for="topk" id="topkOut" class="num">3</output></div>
+          </div>
+          <fieldset class="field">
+            <legend>Theme</legend>
+            <div class="seg" id="themeSeg" role="radiogroup"></div>
+          </fieldset>
+          <div class="field two">
+            <div>
+              <label for="mode">Outputs</label>
+              <select id="mode">
+                <option value="categorical">Choice</option>
+                <option value="continuous">Values</option>
+              </select>
+            </div>
+            <div>
+              <label for="speed">Speed</label>
+              <select id="speed">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+              </select>
+            </div>
+          </div>
+          <div class="field two">
+            <div>
+              <label for="hz">Decision rate</label>
+              <div class="unit-input"><input id="hz" type="number" min="0.1" step="any" value="30" inputmode="decimal" /><span>Hz</span></div>
+            </div>
+            <div class="check-col">
+              <label class="check"><input id="showFrame" type="checkbox" /> <span>Show recording</span></label>
+              <label class="check"><input id="transparent" type="checkbox" /> <span>Transparent</span></label>
+            </div>
+          </div>
+        </section>
+        <section>
+          <h2>Export</h2>
+          <div class="field two">
+            <div>
+              <label for="format">Format</label>
+              <select id="format">
+                <option value="gif">GIF</option>
+                <option value="mp4">MP4</option>
+                <option value="webm">WebM</option>
+                <option value="webm-alpha">WebM with alpha</option>
+              </select>
+            </div>
+            <div>
+              <label for="fps">Frame rate</label>
+              <select id="fps">
+                <option value="24">24 fps</option>
+                <option value="30" selected>30 fps</option>
+                <option value="50">50 fps</option>
+                <option value="60">60 fps</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="size">Size</label>
+            <select id="size">
+              <option value="960x540">960 × 540</option>
+              <option value="1280x720" selected>1280 × 720</option>
+              <option value="1920x1080">1920 × 1080</option>
+              <option value="1080x1080">1080 × 1080</option>
+              <option value="1080x1350">1080 × 1350</option>
+            </select>
+          </div>
+          <div class="field two">
+            <div>
+              <label for="from">From</label>
+              <div class="unit-input"><input id="from" type="number" min="0" step="0.1" value="0" inputmode="decimal" /><span>s</span></div>
+            </div>
+            <div>
+              <label for="to">To</label>
+              <div class="unit-input"><input id="to" type="number" min="0" step="0.1" value="0" inputmode="decimal" /><span>s</span></div>
+            </div>
+          </div>
+          <button id="exportBtn" class="btn primary wide" type="button" disabled>Export GIF</button>
+          <div class="export-progress" id="exportProgress" hidden>
+            <span class="busy-bar"><span id="exportFill"></span></span>
+            <span id="exportNote" class="num"></span>
+            <button id="exportCancel" class="btn" type="button">Cancel</button>
+          </div>
+          <p id="exportResult" class="export-result" aria-live="polite"></p>
+        </section>
+      </aside>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
