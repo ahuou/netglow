@@ -1,0 +1,31 @@
+{
+  "title": "LunarLander · LSTM, no speeds",
+  "description": "An LSTM pilot that sees only position, tilt and leg contacts: no speeds, no spin, so it has to remember earlier ticks to know how it is moving. Taught to imitate the PPO expert (behaviour cloning + DAgger on whole episodes). Landed 76% of 50 fresh seeds (mean return 207). The recording holds two episodes; the state resets where the second one starts.",
+  "inputs": [
+    "x",
+    "y",
+    "angle",
+    "left leg",
+    "right leg"
+  ],
+  "outputs": [
+    "nothing",
+    "left engine",
+    "main engine",
+    "right engine"
+  ],
+  "icons": [
+    "icons/noop.svg",
+    "icons/left.svg",
+    "icons/main.svg",
+    "icons/right.svg"
+  ],
+  "output_mode": "categorical",
+  "input_units": [
+    "",
+    "",
+    "rad",
+    "0/1",
+    "0/1"
+  ]
+}

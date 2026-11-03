@@ -35,6 +35,7 @@ const DEMOS = [
   { id: "lunar-cnn", title: "LunarLander, CNN", sub: "a CNN pilot that flies from pixels" },
   { id: "lunar-mixed", title: "LunarLander, pixels + numbers", sub: "two inputs: frames and 6 plain numbers" },
   { id: "lunar-resmlp", title: "LunarLander, residual MLP", sub: "a skip connection around a two-layer block" },
+  { id: "lunar-lstm", title: "LunarLander, LSTM", sub: "never sees its speed, remembers it instead" },
 ];
 
 const S = {
@@ -461,6 +462,12 @@ function drawRibbon() {
       c.fillStyle = viz.chosen && viz.chosen[t] === out.sel[ii] ? on : "#9698a0";
       c.fillRect(x, slot * rowH, 1, rowH - 1);
     }
+    // episode starts (recurrent models reset their state there): a thin full-height mark
+    if (viz.starts && t > 0 && viz.starts[t] && Math.floor(((x - 1) / w) * viz.T) < t) {
+      c.globalAlpha = 0.9;
+      c.fillStyle = "#f0f0f0";
+      c.fillRect(x, 0, Math.max(1, devicePixelRatio), h);
+    }
     if (viz.match.mismatch && viz.match.mismatch[t]) {
       c.globalAlpha = 1;
       c.fillStyle = "#e5566f";
@@ -476,6 +483,7 @@ function renderMatch() {
   const pill = $("matchPill");
   const rows: [string, string, boolean?][] = [];
   rows.push(["Ticks", String(S.viz!.T)]);
+  if (S.viz!.starts) rows.push(["Episodes (state resets)", String(S.viz!.starts.reduce((a, b) => a + b, 0))]);
   if (m.argmax) {
     const pct = (100 * m.argmax.agree) / m.argmax.total;
     rows.push(["Same choice as log", `${m.argmax.agree} / ${m.argmax.total}`]);

@@ -5,7 +5,7 @@ Drop in a neural network and a recording of its inputs, and get an animated "glo
 video never leave your machine.
 
 **Try it: [ahuou.github.io/netglow](https://ahuou.github.io/netglow/)** (demos: [MLP](https://ahuou.github.io/netglow/?demo=lunar-mlp),
-[CNN](https://ahuou.github.io/netglow/?demo=lunar-cnn), [pixels + numbers](https://ahuou.github.io/netglow/?demo=lunar-mixed), [residual MLP](https://ahuou.github.io/netglow/?demo=lunar-resmlp)).
+[CNN](https://ahuou.github.io/netglow/?demo=lunar-cnn), [pixels + numbers](https://ahuou.github.io/netglow/?demo=lunar-mixed), [residual MLP](https://ahuou.github.io/netglow/?demo=lunar-resmlp), [LSTM](https://ahuou.github.io/netglow/?demo=lunar-lstm)).
 
 ![netglow showing a LunarLander PPO policy](docs/screenshot.png)
 
@@ -71,6 +71,24 @@ video never leave your machine.
 - Demo **LunarLander, residual MLP** (`?demo=lunar-resmlp`): dense 64, then a block of two dense 64 layers with an
   identity skip, taught to imitate the PPO expert (behaviour cloning + DAgger). It landed 50 of 50 fresh seeds
   (mean return 270).
+
+### Recurrent policies (LSTM, GRU)
+
+![netglow showing an LSTM pilot that never sees its speed; its hidden state loops back into itself](docs/lstm.png)
+
+- One-layer, forward `LSTM` / `GRU` cells as torch exports them, in a **step function**:
+  `forward(obs, h0[, c0]) -> (outputs, h[, c])`, with the state as model inputs and graph outputs (see
+  `test/fixtures/make_v2.py`). netglow pairs each state input with the output that hands the state on.
+- The run steps the recording **one tick at a time** and feeds each tick's new state into the next tick, so the
+  match check only reaches 100 % when the state is threaded exactly as it was while flying.
+- **Episode boundaries**: recording key `episode_starts` `(T,)`, 1 on the first tick of each episode (or `dones`,
+  1 on the last tick). The state resets there, to `init_<state input name>` if the recording has it, else zeros.
+  Episode starts are white marks on the timeline.
+- The cell's column is its hidden state `h(t)`, evolving tick by tick; dashed loops on its right are `h(t−1)`
+  feeding back in.
+- Demo **LunarLander, LSTM** (`?demo=lunar-lstm`): sees only x, y, tilt and leg contacts, no speeds and no spin,
+  so it has to remember how it was moving. Taught to imitate the PPO expert (behaviour cloning + DAgger on whole
+  episodes); it landed 38 of 50 fresh seeds (76 %, mean return 207). The recording holds two landings.
 
 ## 30-second quickstart
 
@@ -199,6 +217,8 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | Conv ← conv edges | **exact for the channel mean**: contribution of input channel *c* to the spatial mean of output channel *d*'s pre-activation, `Σ_taps W[d,c,k] · mean(a[c] at the pixels tap k reads)` |
 | Conv node brightness | **summary**: spatial mean of the channel; the feature-map toggle shows the full map |
 | Skip edges (`Add`) | **exact** split: identity `x[j]` into unit *j* (conv: channel mean), projection `P[j,i] · x[i]`; the block's own edges are its last layer's `W[j,i] · a[i]`. If a nonlinearity sits between that layer and the `Add`, the block edges are into that layer's pre-activation (a note says so) |
+| Edges into an LSTM / GRU column | **exact for the candidate gate only**: `W_c[j,i] · x[i]` into the pre-activation of the cell's new content (LSTM `c` gate, GRU `h` gate). The input, forget, output and update gates are not attributed; read them as "what pushes new content", not as a full decomposition of `h(t)` |
+| Recurrent loop edges | same quantity from the previous state: `R_c[j,k] · h(t−1)[k]` (GRU with `linear_before_reset`: times the reset gate `r_t[j]`, which netglow recomputes from the cell's weights). netglow also recomputes the whole cell in JS and checks it against onnxruntime's `h(t)` |
 | Image node edges | **exact**, summed: the per-channel conv contributions of every channel in the stack, added up |
 | Through nonlinearities | **local**: contributions are into pre-activations; a ReLU that is off still draws its incoming edges. This is the linear part of the story, not a gradient through the whole network |
 | Node selection | heuristic: units with the largest mean |contribution| into the shown units of the next column, from the outputs backwards |
@@ -209,6 +229,9 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 
 - Chain-shaped graphs with residual blocks, or several input branches joined by one `Concat`. No attention, no
   gating (`Mul` of two signals), no nested residuals (a block inside a block).
+- Recurrent: one-layer forward LSTM / GRU with default activations, stepped per tick; no bidirectional, stacked
+  (`num_layers > 1` in one node), peephole or `sequence_lens` variants, no sequence inputs `[N, T, F]`. Stepped
+  runs are one `session.run` per tick (a few ms per 100 ticks for small cells).
 - At most one image input per model.
 - Image inputs must be channels-first `[N, C, H, W]`; a channels-last model (leading `Transpose`) is rejected.
 - Grouped / depthwise convolutions are rejected; `Transpose` between conv and dense is warned about.
@@ -224,7 +247,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | --- | --- |
 | `src/onnx/proto.ts` | reading ONNX protobuf (nodes, weights, value infos) and appending graph outputs |
 | `src/analyze.ts` | finding the weighted layers (per input branch, then the trunk after the Concat), residual skips, and which tensors to fetch |
-| `src/run.ts` | onnxruntime-web session, batched run over the recording |
+| `src/run.ts` | onnxruntime-web session, batched run over the recording (stepped, with state threading, for recurrent models) |
 | `src/compute.ts` | contributions, node selection, normalisation, match check |
 | `src/render.ts` | drawing one frame on a canvas, themes, image node, feature maps, hit-testing for drag |
 | `src/settings.ts` | the settings object: defaults, merge, localStorage, JSON and share-link hash |
@@ -244,6 +267,7 @@ the extra demos from `test/fixtures/demos_v2.py`):
 
 ```bash
 node test/smoke.mjs mlp        # also: cnn, rgbf, mixed, resmlp, rescnn, gated (expects a clear rejection), demo:lunar-mlp
+node test/recurrent.mjs        # LSTM / GRU: state threaded and reset, loop edges exact, cell recomputation, demo
 node test/residual.mjs         # skips: exact split at the Add, arcs over the block, no overlaps, rejection of gating
 node test/mixed.mjs            # two-input demo: match, lanes, edges from both branches, drag, short GIF
 node test/panel.mjs            # extreme sizes: no picture, label, title or column overlaps another

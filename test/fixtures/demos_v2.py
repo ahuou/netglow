@@ -277,7 +277,7 @@ def export_lstm(net=None, env=None) -> None:
         if ok and 150 <= len(rec["obs"]) <= 420:
             rec["seed"] = s
             picked.append(rec)
-    obs = np.concatenate([r["obs"][:, PART] for r in picked]).astype(np.float32)
+    obs = np.ascontiguousarray(np.concatenate([r["obs"][:, PART] for r in picked]), dtype=np.float32)
     starts = np.zeros(len(obs), np.uint8)
     starts[0] = starts[len(picked[0]["obs"])] = 1
     # outputs logged while flying; check they are what stepping the exported module with resets gives
@@ -294,7 +294,7 @@ def export_lstm(net=None, env=None) -> None:
     with np.load(os.path.join(out, "recording.npz")) as z:
         arrays = dict(z)
     arrays["episode_starts"] = starts
-    np.savez_compressed(os.path.join(out, "recording.npz"), **arrays)
+    np.savez_compressed(os.path.join(out, "recording.npz"), **{k: np.ascontiguousarray(v) for k, v in arrays.items()})
     write_labels(os.path.join(out, "labels.json"), "LunarLander · LSTM, no speeds", PART_NAMES, td.OUTPUT_NAMES, icons=td.ICON_PATHS,
                  description=f"An LSTM pilot that sees only position, tilt and leg contacts: no speeds, no spin, so it has to "
                              f"remember earlier ticks to know how it is moving. Taught to imitate the PPO expert (behaviour cloning + "
