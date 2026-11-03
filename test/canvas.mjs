@@ -10,7 +10,7 @@ else { await p.setInputFiles("#fileModel", `test/fixtures/${which}.onnx`); await
 await p.waitForFunction(() => window.netglow?.S?.viz);
 for (const kv of extra.split(",").filter(Boolean)) {
   const [k, v] = kv.split("=");
-  if (k === "aiView") await p.selectOption("#aiView", v);
+  if (k === "aiView") await p.selectOption("#st-aiPos", v === "beside" ? "left" : v, { force: true });
   if (k === "maps") await p.setChecked("#showMaps", v === "1");
   if (k === "frame") await p.setChecked("#showFrame", v === "1");
   if (k === "size") await p.selectOption("#size", v);

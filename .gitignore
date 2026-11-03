@@ -11,3 +11,5 @@ test-results/
 docs/exports/
 test/exports/
 test/shots/
+test/baseline/
+test/after/

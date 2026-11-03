@@ -15,7 +15,44 @@ import type { Viz } from "./compute";
 import type { NdArray } from "./io/npy";
 import { frameRGBA, type ImageView } from "./image";
 
-export type AiView = "off" | "above" | "beside";
+/** where a picture goes: a band above the network, a column beside it, a corner inset, or nowhere.
+ *  "auto" (recording only) = above when the AI view is above, else beside left */
+export type PicPos = "above" | "left" | "right" | "tl" | "tr" | "bl" | "br" | "off" | "auto";
+
+/** every size and look knob; all lengths are in pixels at 720 p and scale with the export height */
+export interface Style {
+  nodeScale: number;
+  edgeMin: number;
+  edgeMax: number;
+  labelSize: number;
+  valueSize: number;
+  mapScale: number;
+  imageScale: number;
+  aiPos: PicPos;
+  aiScale: number;
+  recPos: PicPos;
+  recScale: number;
+  colSpacing: number;
+  rowSpacing: number;
+  padding: number;
+  titles: boolean;
+  glow: number;
+  pulse: boolean;
+  pulseIntensity: number;
+  /** colour overrides; "" = use the theme */
+  pos: string;
+  neg: string;
+  bg: string;
+  shape: "circle" | "square";
+  showValues: boolean;
+  showProbs: boolean;
+}
+
+export const DEFAULT_STYLE: Style = {
+  nodeScale: 1, edgeMin: 1, edgeMax: 2.6, labelSize: 17, valueSize: 15, mapScale: 1, imageScale: 1,
+  aiPos: "above", aiScale: 1, recPos: "auto", recScale: 1, colSpacing: 1, rowSpacing: 1, padding: 28, titles: true,
+  glow: 1, pulse: true, pulseIntensity: 1, pos: "", neg: "", bg: "", shape: "circle", showValues: true, showProbs: true,
+};
 
 export interface Theme {
   id: string;
@@ -62,8 +99,8 @@ export interface RenderOpts {
   fps: number;
   /** image models: how to display the input tensor (null for vector inputs) */
   image: ImageView | null;
-  aiView: AiView;
   showMaps: boolean;
+  style: Style;
 }
 
 interface Pic {
@@ -73,6 +110,8 @@ interface Pic {
   w: number;
   h: number;
   caption: string;
+  /** corner insets are drawn on top of the network */
+  corner: boolean;
 }
 
 type RGB = [number, number, number];
@@ -117,37 +156,47 @@ export class Renderer {
     const s = H / 720;
     const cols = this.viz.cols;
     const o = this.opt;
-    // pictures: the recording's render and / or what the AI sees
-    const want: { kind: Pic["kind"]; w0: number; h0: number; caption: string }[] = [];
-    if (o.showFrame && o.frames) want.push({ kind: "rec", w0: o.frames.shape[2], h0: o.frames.shape[1], caption: "Recording" });
-    if (o.aiView !== "off" && o.image) want.push({ kind: "ai", w0: o.image.W, h0: o.image.H, caption: `What the AI sees (${o.image.W}×${o.image.H})` });
-    const above = o.aiView === "above" && !!o.image;
+    const st = o.style;
     const cap = 30 * s;
-    const m = 28 * s;
+    const m = st.padding * s;
+    // pictures: the recording's render and / or what the AI sees, each placed by its own position
+    const want: { kind: Pic["kind"]; w0: number; h0: number; caption: string; pos: PicPos; scale: number }[] = [];
+    const aiOn = !!o.image && st.aiPos !== "off";
+    if (o.showFrame && o.frames && st.recPos !== "off") {
+      const pos = st.recPos === "auto" ? (aiOn && st.aiPos === "above" ? "above" : "left") : st.recPos;
+      want.push({ kind: "rec", w0: o.frames.shape[2], h0: o.frames.shape[1], caption: "Recording", pos, scale: st.recScale });
+    }
+    if (aiOn) want.push({ kind: "ai", w0: o.image!.W, h0: o.image!.H, caption: `What the AI sees (${o.image!.W}×${o.image!.H})`, pos: st.aiPos, scale: st.aiScale });
     let left = 0;
+    let right = 0;
     let topBand = 0;
     this.pics = [];
-    if (want.length && above) {
-      const bandH = H * 0.42;
+    const above = want.filter((p) => p.pos === "above");
+    if (above.length) {
       const gap = 40 * s;
-      let h = bandH - cap - 14 * s;
-      let ws = want.map((p) => (h * p.w0) / p.h0);
-      const total = ws.reduce((a, b) => a + b, 0) + gap * (want.length - 1);
+      const base = H * 0.42 - cap - 14 * s;
+      let hs = above.map((p) => base * p.scale);
+      let ws = above.map((p, i) => (hs[i] * p.w0) / p.h0);
+      const total = ws.reduce((a, b) => a + b, 0) + gap * (above.length - 1);
       const k = Math.min(1, (W - 2 * m) / total);
-      h *= k;
+      hs = hs.map((h) => h * k);
       ws = ws.map((w) => w * k);
-      let x = (W - (ws.reduce((a, b) => a + b, 0) + gap * (want.length - 1))) / 2;
-      want.forEach((p, i) => {
-        this.pics.push({ kind: p.kind, x, y: 14 * s + cap, w: ws[i], h, caption: p.caption });
+      let x = (W - (ws.reduce((a, b) => a + b, 0) + gap * (above.length - 1))) / 2;
+      const hMax = Math.max(...hs);
+      above.forEach((p, i) => {
+        this.pics.push({ kind: p.kind, x, y: 14 * s + cap + (hMax - hs[i]), w: ws[i], h: hs[i], caption: p.caption, corner: false });
         x += ws[i] + gap;
       });
-      topBand = 14 * s + cap + h;
-    } else if (want.length) {
-      const maxW = W * 0.3;
+      topBand = 14 * s + cap + hMax;
+    }
+    for (const side of ["left", "right"] as const) {
+      const group = want.filter((p) => p.pos === side);
+      if (!group.length) continue;
       const gap = 20 * s;
-      const each = Math.min((H - 2 * m - want.length * cap - gap * (want.length - 1)) / want.length, H * 0.62);
-      const sizes = want.map((p) => {
-        let h = each;
+      const each = Math.min((H - 2 * m - group.length * cap - gap * (group.length - 1)) / group.length, H * 0.62);
+      const sizes = group.map((p) => {
+        const maxW = W * 0.3 * p.scale;
+        let h = each * p.scale;
         let w = (h * p.w0) / p.h0;
         if (w > maxW) {
           w = maxW;
@@ -155,40 +204,59 @@ export class Renderer {
         }
         return [w, h];
       });
-      let y = (H - sizes.reduce((a, [, h]) => a + h + cap, 0) - gap * (want.length - 1)) / 2;
-      want.forEach((p, i) => {
+      let y = (H - sizes.reduce((a, [, h]) => a + h + cap, 0) - gap * (group.length - 1)) / 2;
+      const wMax = Math.max(...sizes.map(([w]) => w));
+      group.forEach((p, i) => {
         const [w, h] = sizes[i];
-        this.pics.push({ kind: p.kind, x: m, y: y + cap, w, h, caption: p.caption });
+        this.pics.push({ kind: p.kind, x: side === "left" ? m : W - m - w, y: y + cap, w, h, caption: p.caption, corner: false });
         y += cap + h + gap;
       });
-      left = m + Math.max(...sizes.map(([w]) => w)) + 12 * s;
+      if (side === "left") left = m + wMax + 12 * s;
+      else right = wMax + 12 * s;
     }
-    this.headerY = topBand + 40 * s;
-    const top = topBand + 86 * s;
-    const bot = H - 40 * s;
+    for (const p of want.filter((q) => q.pos.length === 2)) {
+      let h = H * 0.28 * p.scale;
+      let w = (h * p.w0) / p.h0;
+      if (w > W * 0.35 * p.scale) {
+        w = W * 0.35 * p.scale;
+        h = (w * p.h0) / p.w0;
+      }
+      const x = p.pos[1] === "l" ? m : W - m - w;
+      const y = p.pos[0] === "t" ? m + cap : H - m - h;
+      this.pics.push({ kind: p.kind, x, y, w, h, caption: p.caption, corner: true });
+    }
+    this.headerY = topBand + m + 12 * s;
+    const top = topBand + m + 58 * s;
+    const bot = H - m - 12 * s;
     // image node size (image models): the frame at a size where its pixels are visible
     let labelW = 200 * s;
     this.imgRect = null;
     if (this.viz.imageInput && o.image) {
-      const th = Math.min(124 * s, (bot - top) * 0.5);
-      const tw = Math.min(160 * s, (th * o.image.W) / o.image.H);
+      const th = Math.min(124 * s, (bot - top) * 0.5) * st.imageScale;
+      const tw = Math.min(160 * s * st.imageScale, (th * o.image.W) / o.image.H);
       labelW = tw + 96 * s;
       this.imgRect = [0, 0, tw, (tw * o.image.H) / o.image.W];
     }
-    const outW = 224 * s;
+    const outW = 196 * s + m + right;
     this.textX = left + (left ? 0 : m);
-    const x0 = this.textX + labelW;
-    const x1 = W - outW;
+    let x0 = this.textX + labelW;
+    let x1 = W - outW;
+    if (st.colSpacing !== 1) {
+      const c = (x0 + x1) / 2;
+      const hw = ((x1 - x0) / 2) * st.colSpacing;
+      x0 = c - hw;
+      x1 = c + hw;
+    }
     const nc = cols.length;
     this.X = cols.map((_, i) => x0 + ((x1 - x0) * i) / Math.max(1, nc - 1));
     const maxN = Math.max(...cols.map((c) => c.sel.length));
     const pitch = Math.min(46 * s, (bot - top) / Math.max(1, maxN - 1));
-    this.r = Math.max(3, Math.min(11 * s, pitch * 0.3));
-    this.mapSize = Math.max(6, Math.min(pitch * 0.78, 38 * s));
+    this.r = Math.max(3, Math.min(11 * s, pitch * 0.3)) * st.nodeScale;
+    this.mapSize = Math.max(6, Math.min(pitch * 0.78, 38 * s)) * st.mapScale;
     this.half = cols.map((c, ci) => (ci === 0 && this.imgRect ? 2 * s : o.showMaps && c.maps ? this.mapSize / 2 : this.r));
     this.Y = cols.map((c) => {
       const n = c.sel.length;
-      const p = c.kind === "hidden" ? pitch : Math.min(pitch * 1.25, (bot - top) / Math.max(1, n - 1), 56 * s);
+      const p = (c.kind === "hidden" ? pitch : Math.min(pitch * 1.25, (bot - top) / Math.max(1, n - 1), 56 * s)) * st.rowSpacing;
       const span = p * (n - 1);
       const y0 = (top + bot) / 2 - span / 2;
       const ys = new Array(n);
@@ -212,7 +280,8 @@ export class Renderer {
     const k = Math.min(T - 1, Math.floor(tickF));
     const s = this.layout();
     const W = o.width, H = o.height;
-    const C = { off: hex(th.off), on: hex(th.on), pos: hex(th.pos), neg: hex(th.neg), bg: hex(th.bg), text: hex(th.text), dim: hex(th.dim), pulse: hex(th.pulse) };
+    const st = o.style;
+    const C = { off: hex(th.off), on: hex(th.on), pos: hex(st.pos || th.pos), neg: hex(st.neg || th.neg), bg: hex(st.bg || th.bg), text: hex(th.text), dim: hex(th.dim), pulse: hex(th.pulse) };
 
     // easing towards this tick's values (30 ms time constant in recording time)
     const target = viz.cols.map((c) => c.v.subarray(k * c.sel.length, (k + 1) * c.sel.length));
@@ -229,7 +298,7 @@ export class Renderer {
     ctx.save();
     ctx.clearRect(0, 0, W, H);
     if (!o.transparent) {
-      ctx.fillStyle = th.bg;
+      ctx.fillStyle = st.bg || th.bg;
       ctx.fillRect(0, 0, W, H);
     }
 
@@ -238,7 +307,7 @@ export class Renderer {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillStyle = th.dim;
-    viz.cols.forEach((c, ci) => ctx.fillText(c.label, this.X[ci] + (c.kind === "output" ? 40 * s : ci === 0 && this.imgRect ? -this.imgRect[2] / 2 : 0), this.headerY));
+    if (st.titles) viz.cols.forEach((c, ci) => ctx.fillText(c.label, this.X[ci] + (c.kind === "output" ? 40 * s : ci === 0 && this.imgRect ? -this.imgRect[2] / 2 : 0), this.headerY));
 
     // pulse: sweep once per decision tick, or once per m ticks when ticks come faster than ~4 frames
     const ticksPerSec = o.hz * o.speed;
@@ -252,7 +321,8 @@ export class Renderer {
       const ys = this.Y[ci];
       const yTop = Math.min(...ys) - 22 * s;
       const yBot = Math.max(...ys) + 22 * s;
-      ctx.fillStyle = rgba(C.pulse, 0.06 * g);
+      if (!st.pulse) break;
+      ctx.fillStyle = rgba(C.pulse, 0.06 * g * st.pulseIntensity);
       roundRect(ctx, x - 20 * s, yTop, 40 * s, yBot - yTop, 14 * s);
       ctx.fill();
     }
@@ -276,7 +346,7 @@ export class Renderer {
           const st = Math.min(Math.abs(v) / e.scale, 1);
           if (st < 0.06) continue;
           ctx.strokeStyle = rgba(v > 0 ? C.pos : C.neg, 0.12 + 0.68 * st);
-          ctx.lineWidth = (1 + 1.6 * st) * s;
+          ctx.lineWidth = (o.style.edgeMin + (o.style.edgeMax - o.style.edgeMin) * st) * s;
           ctx.beginPath();
           const y0 = this.Y[e.from][i];
           const y1 = this.Y[e.to][j];
@@ -289,7 +359,9 @@ export class Renderer {
     }
 
     // pictures: recording render and what the AI sees, each with a caption
-    for (const p of this.pics) {
+    const drawPics = (corner: boolean) => {
+     for (const p of this.pics) {
+      if (p.corner !== corner) continue;
       ctx.font = `500 ${15 * s}px "Public Sans", system-ui, sans-serif`;
       ctx.textAlign = "left";
       ctx.textBaseline = "alphabetic";
@@ -297,7 +369,9 @@ export class Renderer {
       ctx.fillText(p.caption, p.x, p.y - 10 * s);
       if (p.kind === "rec") this.blitRecording(ctx, k, p.x, p.y, p.w, p.h);
       else this.blitInput(ctx, k, 0, p.x, p.y, p.w, p.h);
-    }
+     }
+    };
+    drawPics(false);
     ctx.textBaseline = "middle";
 
     // input column
@@ -310,13 +384,13 @@ export class Renderer {
       const y = this.Y[0][ii];
       ctx.textAlign = "left";
       ctx.fillStyle = th.text;
-      ctx.font = `600 ${17 * s}px "Public Sans", system-ui, sans-serif`;
+      ctx.font = `600 ${st.labelSize * s}px "Public Sans", system-ui, sans-serif`;
       ctx.fillText(this.labels.inputs[unit] ?? `in ${unit}`, labX, y);
-      {
+      if (st.showValues) {
         const raw = inCol.raw![k * inCol.sel.length + ii];
         ctx.textAlign = "right";
         ctx.fillStyle = th.dim;
-        ctx.font = `400 ${15 * s}px "JetBrains Mono", ui-monospace, monospace`;
+        ctx.font = `400 ${st.valueSize * s}px "JetBrains Mono", ui-monospace, monospace`;
         const u = this.labels.units[unit];
         ctx.fillText(fmt(raw) + (u ? ` ${u}` : ""), xIn - this.r - 12 * s, y);
       }
@@ -340,15 +414,16 @@ export class Renderer {
       const isChosen = unit === ch;
       this.node(ctx, xo, y, p, C, s, isChosen, p);
       const ix = xo + this.r + 16 * s;
-      const isz = 22 * s;
+      const isz = 22 * s * ((st.labelSize - 1) / 16);
       const icon = this.labels.icons[unit];
       const label = this.labels.outputs[unit] ?? `out ${unit}`;
-      ctx.font = `${isChosen ? 700 : 500} ${16 * s}px "Public Sans", system-ui, sans-serif`;
+      const ls = (st.labelSize - 1) / 16;
+      ctx.font = `${isChosen ? 700 : 500} ${(st.labelSize - 1) * s}px "Public Sans", system-ui, sans-serif`;
       const tw = ctx.measureText(label).width;
       const pillW = (icon ? isz + 8 * s : 0) + tw + 16 * s;
       if (isChosen) {
         ctx.fillStyle = th.on;
-        roundRect(ctx, ix - 6 * s, y - 15 * s, pillW, 30 * s, 8 * s);
+        roundRect(ctx, ix - 6 * s, y - 15 * s * ls, pillW, 30 * s * ls, 8 * s * ls);
         ctx.fill();
       }
       const fg = isChosen ? th.bg : p > 0.5 && viz.mode === "continuous" ? th.text : th.dim;
@@ -360,13 +435,14 @@ export class Renderer {
       ctx.textAlign = "left";
       ctx.fillStyle = isChosen ? th.bg : th.text;
       ctx.fillText(label, tx, y + 0.5 * s);
-      if (viz.mode === "continuous" || outCol.sel.length <= 8) {
-        ctx.font = `400 ${13 * s}px "JetBrains Mono", ui-monospace, monospace`;
+      if (st.showProbs && (viz.mode === "continuous" || outCol.sel.length <= 8)) {
+        ctx.font = `400 ${(st.valueSize - 2) * s}px "JetBrains Mono", ui-monospace, monospace`;
         ctx.fillStyle = th.dim;
         const val = viz.mode === "categorical" ? `${Math.round(outCol.raw![k * outCol.sel.length + ii] * 100)}%` : fmt(outCol.raw![k * outCol.sel.length + ii]);
         ctx.fillText(val, ix + pillW + 4 * s, y + 0.5 * s);
       }
     });
+    drawPics(true);
     ctx.restore();
   }
 
@@ -376,7 +452,7 @@ export class Renderer {
       const g = Math.max(glow, (v - 0.55) / 0.45);
       const R = r + 9 * s;
       const grad = ctx.createRadialGradient(x, y, r * 0.6, x, y, R);
-      grad.addColorStop(0, rgba(C.on, 0.42 * g));
+      grad.addColorStop(0, rgba(C.on, Math.min(1, 0.42 * g * this.opt.style.glow)));
       grad.addColorStop(1, rgba(C.on, 0));
       ctx.fillStyle = grad;
       ctx.beginPath();
@@ -385,14 +461,18 @@ export class Renderer {
     }
     // gamma 0.7: perceptual lift so mid activations read as lit; still monotonic in the activation
     ctx.fillStyle = mix(C.off, C.on, Math.max(0, Math.min(1, v)) ** 0.7);
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
+    const square = this.opt.style.shape === "square";
+    const shape = (rr: number) => {
+      ctx.beginPath();
+      if (square) ctx.roundRect(x - rr, y - rr, 2 * rr, 2 * rr, Math.min(3 * s, rr * 0.3));
+      else ctx.arc(x, y, rr, 0, Math.PI * 2);
+    };
+    shape(r);
     ctx.fill();
     if (ring) {
       ctx.strokeStyle = rgba(C.text, 1);
       ctx.lineWidth = 2.5 * s;
-      ctx.beginPath();
-      ctx.arc(x, y, r + 4.5 * s, 0, Math.PI * 2);
+      shape(r + 4.5 * s);
       ctx.stroke();
     }
   }
@@ -438,7 +518,7 @@ export class Renderer {
     const iv = this.opt.image!;
     const b = 3 * s;
     if (v > 0.3) {
-      ctx.fillStyle = rgba(C.on, 0.25 * (v - 0.3) / 0.7);
+      ctx.fillStyle = rgba(C.on, Math.min(1, ((0.25 * (v - 0.3)) / 0.7) * this.opt.style.glow));
       roundRect(ctx, x - b - 6 * s, y - b - 6 * s, w + 2 * b + 12 * s, h + 2 * b + 12 * s, 8 * s);
       ctx.fill();
     }
@@ -447,7 +527,7 @@ export class Renderer {
     this.blitInput(ctx, k, 0, x, y, w, h);
     ctx.textAlign = "right";
     ctx.fillStyle = this.opt.theme.text;
-    ctx.font = `600 ${17 * s}px "Public Sans", system-ui, sans-serif`;
+    ctx.font = `600 ${this.opt.style.labelSize * s}px "Public Sans", system-ui, sans-serif`;
     ctx.fillText(this.labels.inputs[0] ?? "image", x - b - 14 * s, y + h / 2);
     // older frames of the stack, newest first, small and dimmer
     const older = Math.min(iv.frames - 1, 3);

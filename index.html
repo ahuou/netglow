@@ -93,7 +93,7 @@
         </div>
       </main>
 
-      <aside class="panel right" aria-label="View and export settings">
+      <aside class="panel right" id="settingsPanel" aria-label="View and export settings">
         <section id="frameSection" hidden>
           <h2>Recording</h2>
           <canvas id="framePreview" class="frame-preview"></canvas>
@@ -141,14 +141,7 @@
               <label for="hz">Decision rate</label>
               <div class="unit-input"><input id="hz" type="number" min="0.1" step="any" value="30" inputmode="decimal" /><span>Hz</span></div>
             </div>
-            <div class="image-only" hidden>
-              <label for="aiView">What the AI sees</label>
-              <select id="aiView">
-                <option value="above">Above</option>
-                <option value="beside">Beside</option>
-                <option value="off">Off</option>
-              </select>
-            </div>
+            <div></div>
           </div>
           <div class="field two image-only" hidden>
             <div>
@@ -183,6 +176,7 @@
             <label class="check maps-only" hidden><input id="showMaps" type="checkbox" checked /> <span>Feature maps on conv channels</span></label>
             <label class="check"><input id="transparent" type="checkbox" /> <span>Transparent background</span></label>
           </div>
+          <div id="styleGroups" class="style-groups"></div>
         </section>
         <section>
           <h2>Export</h2>

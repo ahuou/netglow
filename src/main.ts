@@ -15,7 +15,8 @@ import { parseJsonRecording, parseNpy, parseNpz, toFloat, type NdArray } from ".
 import { Renderer, THEMES, type Labels, type Theme } from "./render";
 import { runExport, type ExportFormat } from "./export";
 import { imageView, type ImageSettings, type ImageView } from "./image";
-import type { AiView } from "./render";
+import { DEFAULT_STYLE, type PicPos, type Style } from "./render";
+import { DEFAULT_SETTINGS, clearStored, clone, diff, fromHash, loadStored, merge, store, toHash, type Settings } from "./settings";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -60,7 +61,9 @@ const S = {
   topK: 3,
   nodes: 10,
   showFrame: false,
-  aiView: "above" as AiView,
+  style: { ...DEFAULT_STYLE } as Style,
+  /** settings from a share link, applied to the first model that loads */
+  pendingHash: null as unknown,
   showMaps: true,
   img: { range: "auto", layout: "auto", newest: "last" } as ImageSettings,
   imageView: null as ImageView | null,
@@ -165,7 +168,10 @@ async function handleFiles(files: File[]) {
         markFile("labels", f.name + (icons.length ? ` + ${icons.length} icons` : ""));
       }
     }
-    if (models[0]) await loadModelBytes(new Uint8Array(await models[0].arrayBuffer()), models[0].name);
+    if (models[0]) {
+      await loadModelBytes(new Uint8Array(await models[0].arrayBuffer()), models[0].name);
+      applySaved();
+    }
     if (recs[0]) await loadRecording(new Uint8Array(await recs[0].arrayBuffer()), recs[0].name);
     await rebuild(true);
   } catch (e) {
@@ -202,6 +208,7 @@ async function loadDemo(id: string) {
     await loadRecording(rec, `${id}/recording.npz`);
     S.showFrame = !!S.rec?.get("frames");
     ($("showFrame") as HTMLInputElement).checked = S.showFrame;
+    applySaved();
     await rebuild(true);
   } catch (e) {
     fail(e);
@@ -251,6 +258,7 @@ async function rebuild(rerun: boolean) {
   }
   renderLabelsPanel();
   renderMatch();
+  syncStyleUI();
   $("empty").hidden = true;
   $("docTitle").textContent = S.labelsFile?.title ?? S.modelName.replace(/\.onnx$/, "");
   for (const id of ["play", "scrub", "exportBtn", "exportTop"]) ($(id) as HTMLButtonElement).disabled = false;
@@ -259,6 +267,8 @@ async function rebuild(rerun: boolean) {
   syncFrameSection();
   drawRibbon();
   redraw(0);
+  // web fonts may still be loading on first open; draw again once they are in
+  document.fonts?.ready.then(() => S.playing || redraw(0));
 }
 
 function resolveLabels(): Labels {
@@ -303,7 +313,7 @@ function renderOpts() {
     topK: S.topK,
     showFrame: S.showFrame,
     image: S.imageView,
-    aiView: S.aiView,
+    style: S.style,
     showMaps: S.showMaps,
     frames: S.rec?.get("frames") ?? null,
     obs: S.obs!,
@@ -647,11 +657,6 @@ for (const [id, key] of [["pxRange", "range"], ["pxLayout", "layout"], ["pxNewes
     makeRenderer();
     redraw(0);
   });
-$("aiView").addEventListener("change", (e) => {
-  S.aiView = (e.target as HTMLSelectElement).value as AiView;
-  if (S.renderer) S.renderer.opt.aiView = S.aiView;
-  redraw(0);
-});
 $("showMaps").addEventListener("change", (e) => {
   S.showMaps = (e.target as HTMLInputElement).checked;
   if (S.renderer) S.renderer.opt.showMaps = S.showMaps;
@@ -790,3 +795,264 @@ if (q !== "none")
   loadDemo(q).then(() => {
     if (S.viz && !matchMedia("(prefers-reduced-motion: reduce)").matches && !new URLSearchParams(location.search).has("paused")) play();
   });
+
+// ---------- settings: layout, size and look; persisted per model, shareable ----------
+
+type Ctl =
+  | { key: keyof Style; label: string; type: "range"; min: number; max: number; step: number; unit?: string; only?: "image" | "frames" | "maps" }
+  | { key: keyof Style; label: string; type: "select"; options: [string, string][]; only?: "image" | "frames" | "maps" }
+  | { key: keyof Style; label: string; type: "check"; only?: "image" | "frames" | "maps" }
+  | { key: keyof Style; label: string; type: "color" };
+
+const POS: [PicPos, string][] = [["above", "Above"], ["left", "Beside, left"], ["right", "Beside, right"], ["tl", "Corner, top left"], ["tr", "Corner, top right"], ["bl", "Corner, bottom left"], ["br", "Corner, bottom right"], ["off", "Off"]];
+const GROUPS: { title: string; ctls: Ctl[] }[] = [
+  {
+    title: "Layout and size",
+    ctls: [
+      { key: "nodeScale", label: "Node size", type: "range", min: 0.4, max: 2.5, step: 0.05, unit: "×" },
+      { key: "edgeMin", label: "Thinnest edge", type: "range", min: 0.25, max: 6, step: 0.25, unit: "px" },
+      { key: "edgeMax", label: "Strongest edge", type: "range", min: 0.5, max: 10, step: 0.25, unit: "px" },
+      { key: "labelSize", label: "Label text", type: "range", min: 9, max: 36, step: 1, unit: "px" },
+      { key: "valueSize", label: "Value text", type: "range", min: 8, max: 32, step: 1, unit: "px" },
+      { key: "mapScale", label: "Feature-map tiles", type: "range", min: 0.4, max: 2.5, step: 0.05, unit: "×", only: "maps" },
+      { key: "imageScale", label: "Image node", type: "range", min: 0.4, max: 2.5, step: 0.05, unit: "×", only: "image" },
+      { key: "colSpacing", label: "Column spacing", type: "range", min: 0.4, max: 1.4, step: 0.02, unit: "×" },
+      { key: "rowSpacing", label: "Row spacing", type: "range", min: 0.4, max: 1.8, step: 0.02, unit: "×" },
+      { key: "padding", label: "Canvas padding", type: "range", min: 0, max: 96, step: 2, unit: "px" },
+      { key: "titles", label: "Column titles", type: "check" },
+    ],
+  },
+  {
+    title: "Pictures",
+    ctls: [
+      { key: "aiPos", label: "What the AI sees", type: "select", options: POS, only: "image" },
+      { key: "aiScale", label: "AI view size", type: "range", min: 0.3, max: 2, step: 0.05, unit: "×", only: "image" },
+      { key: "recPos", label: "Recording", type: "select", options: [["auto", "Next to the AI view"], ...POS], only: "frames" },
+      { key: "recScale", label: "Recording size", type: "range", min: 0.3, max: 2, step: 0.05, unit: "×", only: "frames" },
+    ],
+  },
+  {
+    title: "Look",
+    ctls: [
+      { key: "glow", label: "Glow", type: "range", min: 0, max: 3, step: 0.05, unit: "×" },
+      { key: "pulse", label: "Decision pulse", type: "check" },
+      { key: "pulseIntensity", label: "Pulse strength", type: "range", min: 0, max: 5, step: 0.1, unit: "×" },
+      { key: "shape", label: "Node shape", type: "select", options: [["circle", "Circle"], ["square", "Square"]] },
+      { key: "showValues", label: "Input values", type: "check" },
+      { key: "showProbs", label: "Output probabilities", type: "check" },
+      { key: "pos", label: "Exciting edges", type: "color" },
+      { key: "neg", label: "Inhibiting edges", type: "color" },
+      { key: "bg", label: "Background", type: "color" },
+    ],
+  },
+];
+
+const themeColour = (key: "pos" | "neg" | "bg") => S.theme[key];
+
+function buildStyleUI() {
+  const host = $("styleGroups");
+  host.innerHTML =
+    GROUPS.map(
+      (g) => `<details class="group"><summary>${g.title}</summary><div class="group-body">${g.ctls
+        .map((c) => {
+          const id = `st-${c.key}`;
+          const only = "only" in c && c.only ? ` data-only="${c.only}"` : "";
+          if (c.type === "range")
+            return `<div class="field"${only}><label for="${id}">${c.label}</label><div class="range-row wide"><input id="${id}" type="range" min="${c.min}" max="${c.max}" step="${c.step}" data-key="${c.key}" /><output for="${id}" class="num" id="${id}-out"></output></div></div>`;
+          if (c.type === "select")
+            return `<div class="field"${only}><label for="${id}">${c.label}</label><select id="${id}" data-key="${c.key}">${c.options.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select></div>`;
+          if (c.type === "check") return `<label class="check"${only}><input id="${id}" type="checkbox" data-key="${c.key}" /> <span>${c.label}</span></label>`;
+          return `<div class="field colour-row"><label for="${id}">${c.label}</label><input id="${id}" type="color" data-key="${c.key}" /></div>`;
+        })
+        .join("")}${g.title === "Look" ? `<button type="button" class="btn small" id="themeColours">Use the theme's colours</button>` : ""}</div></details>`,
+    ).join("") +
+    `<details class="group"><summary>Save and share</summary><div class="group-body share">
+      <p class="hint">Settings are kept for each model in this browser.</p>
+      <div class="btn-row"><button type="button" class="btn small" id="copyLink">Copy link with this look</button><button type="button" class="btn small" id="resetLook">Reset to defaults</button></div>
+      <div class="btn-row"><button type="button" class="btn small" id="exportLook">Export JSON</button><label class="btn small file-mini">Import JSON<input type="file" accept=".json,application/json" id="importLook" /></label></div>
+      <p class="hint" id="shareNote" aria-live="polite"></p>
+    </div></details>`;
+  host.addEventListener("input", (e) => {
+    const el = e.target as HTMLInputElement;
+    const key = el.dataset.key as keyof Style | undefined;
+    if (!key) return;
+    const cur = S.style[key];
+    const v = el.type === "checkbox" ? el.checked : typeof cur === "number" ? Number(el.value) : el.value;
+    (S.style as unknown as Record<string, unknown>)[key] = v;
+    if (key === "edgeMin" && S.style.edgeMax < S.style.edgeMin) S.style.edgeMax = S.style.edgeMin;
+    if (key === "edgeMax" && S.style.edgeMin > S.style.edgeMax) S.style.edgeMin = S.style.edgeMax;
+    syncStyleUI();
+    styleChanged();
+  });
+  $("themeColours").addEventListener("click", () => {
+    S.style.pos = S.style.neg = S.style.bg = "";
+    syncStyleUI();
+    styleChanged();
+  });
+  $("resetLook").addEventListener("click", () => {
+    if (S.model) clearStored(modelKey());
+    const d = clone(DEFAULT_SETTINGS);
+    d.showFrame = S.modelName.startsWith("lunar-") && !!S.rec?.get("frames");
+    applySettings(d);
+    note("Back to the defaults.");
+  });
+  $("copyLink").addEventListener("click", async () => {
+    const h = toHash(collectSettings());
+    history.replaceState(null, "", location.pathname + location.search + h);
+    try {
+      await navigator.clipboard.writeText(location.href);
+      note("Link copied. It carries the look, not the model or recording.");
+    } catch {
+      note("Link is in the address bar. It carries the look, not the model or recording.");
+    }
+  });
+  $("exportLook").addEventListener("click", () => {
+    const blob = new Blob([JSON.stringify(collectSettings(), null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "netglow-settings.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+  $("importLook").addEventListener("change", async (e) => {
+    const f = (e.target as HTMLInputElement).files?.[0];
+    (e.target as HTMLInputElement).value = "";
+    if (!f) return;
+    try {
+      applySettings(merge(collectSettings(), JSON.parse(await f.text())));
+      note(`Applied ${f.name}.`);
+    } catch {
+      note(`${f.name} is not a settings file.`);
+    }
+  });
+}
+
+function note(msg: string) {
+  $("shareNote").textContent = msg;
+}
+
+/** reflect S.style in the controls, and show only the rows that apply to this model */
+function syncStyleUI() {
+  const hasImage = !!S.viz?.imageInput;
+  const hasFrames = !!S.rec?.get("frames");
+  const hasMaps = !!S.viz?.cols.some((c) => c.maps);
+  document.querySelectorAll<HTMLElement>("#styleGroups [data-only]").forEach((el) => {
+    const o = el.dataset.only;
+    el.hidden = o === "image" ? !hasImage : o === "frames" ? !hasFrames : !hasMaps;
+  });
+  for (const g of GROUPS)
+    for (const c of g.ctls) {
+      const el = $<HTMLInputElement>(`st-${c.key}`);
+      const v = S.style[c.key];
+      if (c.type === "check") el.checked = !!v;
+      else if (c.type === "color") el.value = (v as string) || themeColour(c.key as "pos" | "neg" | "bg");
+      else el.value = String(v);
+      if (c.type === "range") $(`st-${c.key}-out`).textContent = `${+Number(v).toFixed(2)}${c.unit === "px" ? "" : c.unit ?? ""}`;
+    }
+}
+
+function styleChanged() {
+  if (S.renderer) {
+    S.renderer.opt.style = S.style;
+    redraw(0);
+  }
+  saveSoon();
+}
+
+function modelKey() {
+  return `${S.modelName}:${S.model?._bytes.length ?? 0}`;
+}
+
+function collectSettings(): Settings {
+  return {
+    nodes: S.nodes,
+    topK: S.topK,
+    theme: S.theme.id,
+    mode: S.modeTouched ? S.mode : null,
+    speed: S.speed,
+    showFrame: S.showFrame,
+    transparent: S.transparent,
+    showMaps: S.showMaps,
+    img: { ...S.img },
+    format: ($("format") as HTMLSelectElement).value as Settings["format"],
+    fps: Number(($("fps") as HTMLSelectElement).value),
+    size: ($("size") as HTMLSelectElement).value,
+    style: { ...S.style },
+  };
+}
+
+/** set every control and state field from a settings object, then redraw (and re-select nodes if needed) */
+function applySettings(st: Settings, quiet = false) {
+  const needViz = st.nodes !== S.nodes || (st.mode ?? null) !== (S.modeTouched ? S.mode : null);
+  S.nodes = st.nodes;
+  S.topK = st.topK;
+  S.theme = THEMES.find((t) => t.id === st.theme) ?? THEMES[0];
+  S.speed = st.speed;
+  S.showFrame = st.showFrame;
+  S.transparent = st.transparent;
+  S.showMaps = st.showMaps;
+  S.img = { ...st.img };
+  S.style = { ...st.style };
+  if (st.mode) {
+    S.mode = st.mode;
+    S.modeTouched = true;
+  } else S.modeTouched = false;
+  const set = (id: string, v: string | boolean) => {
+    const el = $<HTMLInputElement>(id);
+    if (typeof v === "boolean") el.checked = v;
+    else el.value = v;
+  };
+  set("nodes", String(st.nodes));
+  $("nodesOut").textContent = String(st.nodes);
+  set("topk", String(st.topK));
+  $("topkOut").textContent = String(st.topK);
+  themeSeg.querySelectorAll("button").forEach((x) => x.setAttribute("aria-checked", String((x as HTMLElement).dataset.theme === S.theme.id)));
+  if (st.mode) set("mode", st.mode);
+  set("speed", String(st.speed));
+  set("showFrame", st.showFrame);
+  set("transparent", st.transparent);
+  set("showMaps", st.showMaps);
+  set("pxRange", st.img.range);
+  set("pxLayout", st.img.layout);
+  set("pxNewest", st.img.newest);
+  set("format", st.format);
+  set("fps", String(st.fps));
+  set("size", st.size);
+  $("exportBtn").textContent = `Export ${FORMAT_LABEL[st.format]}`;
+  syncStyleUI();
+  if (quiet) return;
+  if (needViz && S.trace) rebuild(false).catch(fail);
+  else if (S.viz) {
+    makeRenderer();
+    syncFrameSection();
+    drawRibbon();
+    redraw(0);
+  }
+  saveSoon();
+}
+
+/** after a model loads: a share link wins, then what this browser stored for the model */
+function applySaved() {
+  const src = S.pendingHash ?? (S.model ? loadStored(modelKey()) : null);
+  S.pendingHash = null;
+  if (src) applySettings(merge(collectSettings(), src), true);
+}
+
+let saveTimer = 0;
+function saveSoon() {
+  clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => {
+    if (S.model) store(modelKey(), collectSettings());
+  }, 300);
+}
+
+buildStyleUI();
+syncStyleUI();
+// any other control in the settings panel persists too
+$("settingsPanel").addEventListener("change", saveSoon);
+themeSeg.addEventListener("click", () => {
+  syncStyleUI();
+  saveSoon();
+});
+S.pendingHash = fromHash(location.hash);
+void diff;

@@ -58,6 +58,38 @@ For a plain torch module, see `python/export_recording.py` (`export_onnx`, `save
 
 `npm run build` produces a static `dist/` you can host anywhere (relative paths, no server code).
 
+## Settings
+
+Everything below applies live, is drawn into every export (GIF, MP4, WebM, WebM with alpha), and is kept
+per model in this browser (localStorage). **Save and share** in the View panel resets to the defaults,
+exports or imports the settings as JSON, and copies a link whose `#look=…` hash carries the look (not the
+model or the recording) to anyone who opens it. Lengths are pixels at 720 p and scale with the export size.
+
+| Group | Setting | Default | Range / options |
+| --- | --- | --- | --- |
+| View | Nodes per column | 10 | 3 to 24 |
+| View | Edges per node (top-k) | 3 | 1 to 8 |
+| View | Theme | Ember | Ember, Ice, Phosphor, Paper |
+| View | Outputs | from the model | Choice (softmax, argmax ringed) or Values |
+| View | Speed, decision rate | 1×, from the recording | 0.25× to 2×, any Hz |
+| View | Recording on canvas, transparent background, feature maps | off, off, on | toggles |
+| View (image models) | Pixel values, channels, newest frame | auto | 0–255 / 0–1 / −1–1 / stretch; gray / RGB; last / first |
+| Layout and size | Node size | 1× | 0.4× to 2.5× |
+| Layout and size | Thinnest / strongest edge | 1 / 2.6 px | 0.25 to 10 px (edge width grows with the contribution) |
+| Layout and size | Label text / value text | 17 / 15 px | 9 to 36 / 8 to 32 px |
+| Layout and size | Feature-map tiles, image node | 1×, 1× | 0.4× to 2.5× |
+| Layout and size | Column spacing, row spacing | 1×, 1× | 0.4× to 1.4×, 0.4× to 1.8× |
+| Layout and size | Canvas padding | 28 px | 0 to 96 px |
+| Layout and size | Column titles | on | toggle |
+| Pictures | What the AI sees: position, size | above, 1× | above, beside left / right, a corner, off; 0.3× to 2× |
+| Pictures | Recording: position, size | next to the AI view, 1× | same positions; 0.3× to 2× |
+| Look | Glow | 1× | 0 to 3× |
+| Look | Decision pulse, strength | on, 1× | toggle, 0 to 5× |
+| Look | Node shape | circle | circle, square |
+| Look | Input values, output probabilities | on, on | toggles |
+| Look | Exciting / inhibiting edge colour, background | the theme's | any colour; "Use the theme's colours" resets them |
+| Export | Format, frame rate, size, from / to | GIF, 30 fps, 1280×720, whole recording | GIF, MP4, WebM, WebM with alpha; 24 to 60 fps; 5 sizes |
+
 ## Input format
 
 ### Model: `.onnx`
@@ -143,6 +175,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | `src/run.ts` | onnxruntime-web session, batched run over the recording |
 | `src/compute.ts` | contributions, node selection, normalisation, match check |
 | `src/render.ts` | drawing one frame on a canvas, themes, image node, feature maps, hit-testing for drag |
+| `src/settings.ts` | the settings object: defaults, merge, localStorage, JSON and share-link hash |
 | `src/image.ts` | turning an image input tensor back into pixels (range, gray / RGB, frame stack) |
 | `src/export.ts` | GIF (gifenc) and WebCodecs video (mediabunny) |
 | `src/io/npy.ts` | `.npy` / `.npz` (zip + DecompressionStream) / JSON readers |
@@ -160,5 +193,6 @@ With `npm run dev -- --port 5181` running (fixtures come from `test/make_fixture
 node test/smoke.mjs mlp        # also: cnn, rgbf, residual (expects a clear rejection), demo:lunar-mlp
 node test/image.mjs            # image node, AI view, feature maps, pixel-range detection
 node test/drag.mjs             # drag and keyboard reorder
+node test/settings.mjs         # sizes and look change the render and the export; persist, reset, JSON, share link
 node test/export.mjs mlp gif out.gif
 ```
