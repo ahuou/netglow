@@ -1,7 +1,7 @@
 import { chromium } from "@playwright/test";
 const b = await chromium.launch();
 const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
-await p.goto("http://localhost:5181/?demo=none");
+await p.goto(process.env.URL ?? "http://localhost:5181/?demo=none");
 await p.setInputFiles("#fileModel", "test/fixtures/mlp.onnx");
 await p.setInputFiles("#fileRec", "test/fixtures/mlp.npz");
 await p.waitForFunction(() => window.netglow?.S?.viz);

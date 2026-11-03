@@ -65,8 +65,16 @@ def export_bytes(
     output_name: str = "logits",
     opset: int = 17,
     batched: bool | None = None,
+    state: Sequence[Any] | None = None,
+    state_names: Sequence[str] | None = None,
+    state_out_names: Sequence[str] | None = None,
 ) -> bytes:
-    """Like :func:`export` but returns the ONNX file as bytes."""
+    """Like :func:`export` but returns the ONNX file as bytes.
+
+    Recurrent step functions ``forward(obs..., h0[, c0]) -> (outputs, h[, c])``: pass the initial state tensors as
+    ``state`` (with their batch axis, e.g. LSTM ``[1, 1, H]``); they become extra inputs ``state_names`` (default
+    h0, c0, ...) and outputs ``state_out_names`` (h, c, ...) with fixed shapes, which the viewer threads tick to tick.
+    """
     torch = _torch()
     from ._sb3 import is_sb3, from_sb3
 
@@ -81,20 +89,23 @@ def export_bytes(
         input_names = getattr(model, "input_names", None)
     names, xs = normalize_inputs(example_inputs, input_names)
     xs = _batched(xs, batched)
+    st = tuple(as_tensor(v) for v in (state or ()))
+    snames = list(state_names or ["h0", "c0", "s2", "s3"][: len(st)])
+    souts = list(state_out_names or [n[:-1] if n.endswith("0") else n + "_out" for n in snames])
     module = model.eval().cpu()
     buf = io.BytesIO()
     kw = dict(
-        input_names=names,
-        output_names=[output_name],
+        input_names=names + snames,
+        output_names=[output_name] + souts,
         dynamic_axes={**{n: {0: "N"} for n in names}, output_name: {0: "N"}},
         opset_version=opset,
         do_constant_folding=True,
     )
     with torch.no_grad():
         try:
-            torch.onnx.export(module, xs, buf, dynamo=False, **kw)
+            torch.onnx.export(module, xs + st, buf, dynamo=False, **kw)
         except TypeError:  # torch < 2.5 has no dynamo kwarg; the legacy exporter is the default there
-            torch.onnx.export(module, xs, buf, **kw)
+            torch.onnx.export(module, xs + st, buf, **kw)
     import onnx
 
     m = onnx.load_from_string(buf.getvalue())

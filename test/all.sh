@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run every browser test against a dev server on :5181 (npm run dev -- --port 5181). Exits non-zero on the first failure.
+# Run every browser test against a dev server on :5181 (npm run dev -- --port 5181), or URL=http://localhost:PORT/?demo=none. Exits non-zero on any failure.
 set -u
 cd "$(dirname "$0")/.."
 fail=0

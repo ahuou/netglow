@@ -112,3 +112,44 @@ def test_example_shape_guess():
 def test_export_needs_example(bad):
     with pytest.raises(ValueError):
         netglow.export_bytes(nn.Linear(2, 2))
+
+
+H = 16
+
+
+class LSTMStep(nn.Module):
+    """one tick with explicit state: forward(obs, h0, c0) -> (logits, h, c), the form netglow steps"""
+
+    def __init__(s):
+        super().__init__()
+        s.enc = nn.Linear(5, 16)
+        s.rnn = nn.LSTM(16, H)
+        s.head = nn.Linear(H, 3)
+
+    def forward(s, obs, h0, c0):
+        y, (h, c) = s.rnn(torch.tanh(s.enc(obs)).unsqueeze(0), (h0, c0))
+        return s.head(y[0]), h, c
+
+
+def lstm_state():
+    return (torch.zeros(1, 1, H), torch.zeros(1, 1, H))
+
+
+def test_lstm_recorder_episodes(tmp_path, load_in_viewer):
+    """the Recorder threads the state, resets it at episode starts and saves episode_starts; the viewer must agree"""
+    torch.manual_seed(4)
+    rng = np.random.default_rng(4)
+    rec = netglow.Recorder(LSTMStep(), out_dir=tmp_path, fps=20, state=lstm_state())
+    for t in range(60):
+        out = rec.add(rng.normal(size=5).astype(np.float32), episode_start=t % 20 == 0)
+        rec.ticks[-1]["action"] = np.asarray(int(np.argmax(out)))
+    rec.save()
+    z = np.load(tmp_path / "recording.npz")
+    assert z["episode_starts"].tolist() == [1 if t % 20 == 0 else 0 for t in range(60)]
+    import onnx
+
+    m = onnx.load(tmp_path / "model.onnx")
+    assert [i.name for i in m.graph.input if i.name not in {w.name for w in m.graph.initializer}] == ["obs", "h0", "c0"]
+    assert [o.name for o in m.graph.output] == ["logits", "h", "c"]
+    r = load_in_viewer(tmp_path)
+    assert r["match"] == "Match 100%" and r["inputs"] == ["obs:vector"]

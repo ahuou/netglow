@@ -182,6 +182,9 @@ Then drop the three files from `run/` on the page.
   what the env really got. It stores the env render (240 px wide) and names inputs / outputs for common envs
   (LunarLander, CartPole, Acrobot, MountainCar, Pendulum).
 - `obs` per tick: an array, a tuple (forward's order) or a dict `{input name: array}`. float64 is stored as float32.
+- Recurrent step functions `forward(obs, h0, c0) -> (logits, h, c)`: pass `state=(h0, c0)` (the initial state, e.g.
+  `torch.zeros(1, 1, H)` each) to `Recorder` / `record` / `live`. The state is threaded per tick, reset on
+  `episode_start=True` (`record` sets it after every reset), and saved as `episode_starts` + `init_h0` / `init_c0`.
 
 ## Live mode
 
@@ -212,6 +215,9 @@ In the page, **Live** (left panel) takes a `ws://` address or a port and reconne
 **Record** keeps what streams in from then on; **Stop and save** downloads it as an ordinary `recording.npz` (with a
 link to the model). **Disconnect** leaves the last window loaded for scrubbing and export. Normalisation and node
 selection use only the window, so brightness is relative to the last few seconds.
+Recurrent models step one tick per run with the state carried across ticks and reset at streamed episode starts;
+a page that joins mid-episode starts from the state Python sends with each tick, so the match stays exact. The saliency
+heatmap and compare mode (the second model reruns on each window) work live too.
 
 ## Settings
 

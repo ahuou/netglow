@@ -52,7 +52,7 @@ for (const [w, h] of [[1440, 900], [390, 844]]) {
   // ---- embed code for a demo carries the demo and the look
   const code = await p.$eval("#embedCode", (e) => e.value);
   console.log(code.slice(0, 120));
-  assert.match(code, /^<iframe src="http:\/\/localhost:5181\/\?demo=lunar-cnn&embed=1#look=[\w-]+" width="720" height="405"/);
+  assert.ok(code.startsWith(`<iframe src="${base}?demo=lunar-cnn&embed=1#look=`) && code.includes(`width="720" height="405"`), code);
   assert.match(code, /title="netglow: LunarLander · CNN from pixels"/);
   // the look survives into the embed
   const src = code.match(/src="([^"]+)"/)[1];

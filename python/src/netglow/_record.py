@@ -59,6 +59,8 @@ def save_recording(
     input_names: Sequence[str] | None = None,
     output_names: Sequence[str] | None = None,
     fps: float | None = None,
+    episode_starts: np.ndarray | None = None,
+    init: dict | None = None,
     **_ignored,
 ) -> str:
     """Write the netglow recording format (np.savez_compressed, no pickled objects).
@@ -70,6 +72,8 @@ def save_recording(
     t        float64 (T,) seconds (defaults to tick / fps)
     fps      decision rate in Hz
     frames   uint8 (T, H, W, 3) renders for context
+    episode_starts  uint8 (T,), 1 on the first tick of each episode (recurrent models reset their state there)
+    init     {state input name: array}: the recurrent state fed into tick 0, stored as ``init_<name>`` (default zeros)
     """
     if isinstance(obs, dict):
         arrays = {f"obs_{k}": np.asarray(v) for k, v in obs.items()}
@@ -91,13 +95,17 @@ def save_recording(
         arrays["fps"] = np.float64(fps)
     if frames is not None:
         arrays["frames"] = np.asarray(frames, dtype=np.uint8)
+    if episode_starts is not None:
+        arrays["episode_starts"] = np.asarray(episode_starts, dtype=np.uint8)
+    for k, v in (init or {}).items():
+        arrays[f"init_{k}"] = np.asarray(v, dtype=np.float32)
     if input_names is not None:
         arrays["input_names"] = np.asarray(list(input_names), dtype=str)
     if output_names is not None:
         arrays["output_names"] = np.asarray(list(output_names), dtype=str)
     for k, v in arrays.items():
         assert v.dtype != object, k
-        if k not in ("fps", "input_names", "output_names"):
+        if k not in ("fps", "input_names", "output_names") and not k.startswith("init_"):
             assert len(v) == T, f"{k} has length {len(v)}, expected {T}"
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     np.savez_compressed(path, **arrays)
@@ -155,6 +163,9 @@ class Recorder:
     output        raw model output for that tick; computed with the model when omitted.
     live          stream every tick to the viewer over a localhost WebSocket (see netglow.live).
     keep          ticks kept in memory for save(): all by default, the last 2000 when live with no out_dir.
+    state         recurrent models: the initial state tensors (e.g. LSTM ``(zeros(1, 1, H), zeros(1, 1, H))``) for a
+                  step function ``forward(obs..., h0, c0) -> (outputs, h, c)``. The state is threaded here and in
+                  the viewer and reset at episode starts (``episode_start=True`` on add / infer).
     """
 
     def __init__(
@@ -174,6 +185,8 @@ class Recorder:
         quiet: bool = False,
         web: str | None = None,
         keep: int | None = None,
+        state: Sequence[Any] | None = None,
+        state_names: Sequence[str] | None = None,
     ):
         from ._sb3 import from_sb3, is_sb3
 
@@ -190,6 +203,11 @@ class Recorder:
         # every tick when writing files; a live-only session keeps the last 2000 so memory stays flat
         self.ticks: collections.deque[dict] = collections.deque(maxlen=keep if keep else (None if out_dir or not live else 2000))
         self.onnx: bytes | None = None
+        # recurrent step function: forward(obs..., *state) -> (outputs, *new_state); state threaded here and in the viewer
+        self.init_state = None if state is None else [np.asarray(v.detach().cpu() if hasattr(v, "detach") else v, dtype=np.float32) for v in state]
+        self.state_names = list(state_names or ["h0", "c0", "s2", "s3"][: len(self.init_state or [])])
+        self.state = None
+        self._start: bool | None = None  # an episode start given to infer(), for the add() that follows
         self.server = None
         if live:
             from ._live import LiveServer
@@ -222,39 +240,64 @@ class Recorder:
             return
         from ._export import export_bytes
 
+        st = dict(state=self.init_state, state_names=self.state_names) if self.init_state is not None else {}
         if self.example_inputs is not None:
-            self.onnx = export_bytes(self.model, self.example_inputs, self.input_names)
+            self.onnx = export_bytes(self.model, self.example_inputs, self.input_names, **st)
         else:
-            self.onnx = export_bytes(self.model, tuple(x.values()), self.input_names, batched=False)
+            self.onnx = export_bytes(self.model, tuple(x.values()), self.input_names, batched=False, **st)
 
-    def _run(self, x: dict[str, np.ndarray]) -> np.ndarray:
+    def _run(self, x: dict[str, np.ndarray], start: bool) -> np.ndarray:
         import torch
 
+        args = [torch.as_tensor(v)[None] for v in x.values()]
+        if self.init_state is not None:
+            if start or self.state is None:
+                self.state = [v.copy() for v in self.init_state]
+            self.state_in = [v.copy() for v in self.state]
+            args += [torch.as_tensor(v) for v in self.state]
         with torch.no_grad():
-            y = self.model.eval()(*[torch.as_tensor(v)[None] for v in x.values()])
+            y = self.model.eval()(*args)
+        if self.init_state is not None:
+            self.state = [np.asarray(v.cpu(), dtype=np.float32) for v in y[1:1 + len(self.init_state)]]
         if isinstance(y, (tuple, list)):
             y = y[0]
         return y[0].cpu().numpy()
 
-    def infer(self, obs) -> np.ndarray | None:
-        """The model's raw output for one observation (exports the model on first use)."""
+    def _is_start(self, episode_start: bool | None) -> bool:
+        return bool(episode_start) or not self.ticks and self._start is None and self.state is None
+
+    def infer(self, obs, episode_start: bool | None = None) -> np.ndarray | None:
+        """The model's raw output for one observation (exports the model on first use). Recurrent models step
+        their state; ``episode_start=True`` resets it first. Pass the result to ``add(obs, output=...)``."""
         x = self._split(obs)
         self._ensure_model(x)
-        return None if self.model is None else np.asarray(self._run(x), dtype=np.float32).reshape(-1)
+        if self.model is None:
+            return None
+        start = self._is_start(episode_start)
+        self._start = start
+        return np.asarray(self._run(x, start), dtype=np.float32).reshape(-1)
 
-    def add(self, obs, output=None, action=None, frame=None) -> np.ndarray | None:
-        """Record one tick. Returns the output (computed with the model if not given)."""
+    def add(self, obs, output=None, action=None, frame=None, episode_start: bool | None = None) -> np.ndarray | None:
+        """Record one tick. Returns the output (computed with the model if not given).
+        ``episode_start``: this tick begins an episode (recurrent models reset their state here)."""
         x = self._split(obs)
         self._ensure_model(x)
         if output is None and self.model is not None:
-            output = self._run(x)
+            start = self._is_start(episode_start)
+            output = self._run(x, start)
+        else:
+            start = bool(episode_start) or bool(self._start) or not self.ticks
+        self._start = None
         if output is not None:
             if hasattr(output, "detach"):
                 output = output.detach().cpu().numpy()
             output = np.asarray(output, dtype=np.float32).reshape(-1)
         if frame is not None:
             frame = resize_frame(frame, self.frame_width)
-        tick = {"obs": x, "output": output, "action": None if action is None else np.asarray(action), "frame": frame}
+        tick = {"obs": x, "output": output, "action": None if action is None else np.asarray(action), "frame": frame,
+                "start": start}
+        if self.init_state is not None and getattr(self, "state_in", None) is not None:
+            tick["state_in"] = dict(zip(self.state_names, self.state_in))
         self.ticks.append(tick)
         if self.server is not None:
             if not self.server.has_model and self.onnx is not None:
@@ -290,12 +333,16 @@ class Recorder:
         names = list(self.ticks[0]["obs"].keys())
         obs = {n: np.stack([t["obs"][n] for t in self.ticks]) for n in names}
         has = lambda k: all(t[k] is not None for t in self.ticks)
+        starts = np.array([1] + [int(t.get("start", False)) for t in list(self.ticks)[1:]], np.uint8)
         return {
             "obs": obs[names[0]] if len(names) == 1 else obs,
             "outputs": np.stack([t["output"] for t in self.ticks]) if has("output") else None,
             "actions": np.stack([t["action"] for t in self.ticks]) if has("action") else None,
             "frames": np.stack([t["frame"] for t in self.ticks]) if has("frame") else None,
             "fps": self.fps,
+            "episode_starts": starts if self.init_state is not None or starts[1:].any() else None,
+            # the state fed into the first kept tick, so a replay that starts mid-episode is still exact
+            "init": self.ticks[0].get("state_in") or {},
         }
 
     def save(self, out_dir: str | None = None) -> str:
@@ -362,6 +409,7 @@ def record(
     algo: str | None = None,
     quiet: bool = False,
     web: str | None = None,
+    state=None,
 ) -> Recorder:
     """Run a policy in a Gymnasium env and write ``out_dir/{model.onnx, recording.npz, labels.json}``.
 
@@ -371,6 +419,8 @@ def record(
     steps     ticks to record; episodes are reset and concatenated.
     frames    store the env's rgb render (~240 px wide) beside the network.
     live      also stream every tick to the browser (realtime pacing at the env fps by default).
+    state     recurrent torch step function forward(obs, h0[, c0]) -> (outputs, h[, c]): the initial state
+              tensors; reset at every episode start (see :class:`Recorder`).
     Returns the :class:`Recorder` (``.save()`` already called when out_dir is set).
     """
     import gymnasium as gym
@@ -388,30 +438,32 @@ def record(
     if names is None and isinstance(space, gym.spaces.Dict):
         names = list(space.spaces.keys())
     rec = Recorder(policy, out_dir=out_dir, input_names=names, title=title or (f"{env_id}" if env_id else None), fps=fps,
-                   labels={k: v for k, v in lab.items()}, live=live, port=port, quiet=quiet, web=web)
+                   labels={k: v for k, v in lab.items()}, live=live, port=port, quiet=quiet, web=web, state=state)
     realtime = live if realtime is None else realtime
     obs, _ = env.reset(seed=seed)
     ret, episodes, period = 0.0, 1, 1.0 / fps if fps else 0.0
     t_next = time.perf_counter()
+    start = True
     try:
         for _ in range(steps):
             frame = env.render() if frames else None
             x = {k: obs[k] for k in names} if isinstance(obs, dict) else obs
-            out = rec.infer(x)
+            out = rec.infer(x, episode_start=start)
             if act is not None:
                 a = act(obs, out)
             elif hasattr(policy, "predict"):
                 a = policy.predict(obs)
             else:
                 a = _action_from(out, env.action_space)
-            rec.add(x, output=out, action=a, frame=frame)
+            rec.add(x, output=out, action=a, frame=frame, episode_start=start)
+            start = False
             obs, r, term, trunc, _ = env.step(a)
             ret += float(r)
             if term or trunc:
                 if not quiet:
                     print(f"[netglow] episode {episodes}: return {ret:.1f}")
                 obs, _ = env.reset()
-                ret, episodes = 0.0, episodes + 1
+                ret, episodes, start = 0.0, episodes + 1, True
             if realtime and period:
                 t_next += period
                 dt = t_next - time.perf_counter()

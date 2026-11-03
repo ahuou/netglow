@@ -12,7 +12,9 @@ Wire format (every message is binary)::
     {"type": "model", "fps": 50, "labels": {...}, "inputs": ["obs"], "size": n}   payload: model.onnx
     {"type": "tick", "i": 17, "arrays": [{"key": "obs_obs", "dtype": "<f4", "shape": [8], "size": 32}, ...]}
 
-Tick array keys are the recording keys: ``obs_<input name>``, ``outputs``, ``actions``, ``frames``.
+Tick array keys are the recording keys: ``obs_<input name>``, ``outputs``, ``actions``, ``frames``,
+``episode_starts`` (1 on an episode's first tick) and, for recurrent models, ``init_<state input>`` (the state fed
+into this tick, so a viewer that joins mid-episode starts from the right state).
 
 The same port also answers plain HTTP with the viewer itself (from a local build, or a cached copy of
 the hosted page), so ``http://localhost:PORT/`` works in any browser without the https -> localhost
@@ -60,6 +62,10 @@ def encode_tick(i: int, tick: dict) -> bytes:
         add("actions", a.astype(np.int64) if np.issubdtype(a.dtype, np.integer) else a.astype(np.float32))
     if tick.get("frame") is not None:
         add("frames", np.asarray(tick["frame"], dtype=np.uint8))
+    if tick.get("start") is not None:
+        add("episode_starts", np.uint8(1 if tick["start"] else 0))
+    for name, v in (tick.get("state_in") or {}).items():  # recurrent: the state fed into this tick
+        add(f"init_{name}", np.asarray(v, dtype=np.float32))
     return encode({"type": "tick", "i": i, "arrays": arrays}, blobs)
 
 

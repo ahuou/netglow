@@ -41,6 +41,8 @@ export interface LiveHost {
     iconFiles: Map<string, unknown>;
     iconOverride: Map<number, unknown>;
     nameOverride: { inputs: Map<number, string>; outputs: Map<number, string> };
+    /** compare mode's second model (main.ts); its trace is dropped so it reruns on each window */
+    cmp: { trace: unknown } | null;
   };
   loadModel(bytes: Uint8Array, name: string): Promise<void>;
   rebuild(rerun: boolean): Promise<void>;
@@ -57,6 +59,8 @@ interface Tick {
   trace?: Map<string, Float32Array>;
   /** per fetched tensor: its per-tick dims (batch removed) */
   dims?: Map<string, number[]>;
+  /** recurrent models: the state fed into this tick, per state input */
+  stateIn?: Map<string, Float32Array>;
 }
 
 const KIND: Record<string, string> = { f4: "f4", f8: "f8", i1: "i1", i2: "i2", i4: "i4", i8: "i8", u1: "u1", b1: "u1", u2: "u2", u4: "u4", u8: "u8" };
@@ -131,6 +135,7 @@ export function initLive(host: LiveHost) {
   let hz = 30;
   let fpsFromModel = false;
   let pending: Tick[] = [];
+  const state = new Map<string, Float32Array>(); // recurrent state carried from tick to tick
   let win: Tick[] = [];
   let W = 300;
   let newest = -1;
@@ -230,6 +235,7 @@ export function initLive(host: LiveHost) {
     session = null;
     pending = [];
     win = [];
+    state.clear();
     first = true;
     newest = -1;
     arrivals = [];
@@ -275,6 +281,28 @@ export function initLive(host: LiveHost) {
     schedule();
   }
 
+  /** ticks -> recording arrays: stacked per key; per-tick state hand-overs become one init_<input> (the state fed into
+   *  the first tick, so the slice replays exactly) and episode_starts gets a 1 on its first tick */
+  function asRecording(ticks: Tick[]): Map<string, NdArray> {
+    const rec = new Map<string, NdArray>();
+    for (const key of ticks[ticks.length - 1].arrays.keys()) {
+      if (key.startsWith("init_")) continue;
+      const parts = ticks.map((t) => t.arrays.get(key));
+      if (parts.every((x) => x && x.data.length === parts[0]!.data.length)) rec.set(key, stack(parts as NdArray[]));
+    }
+    if (plan?.states.length) {
+      const st = new Uint8Array(ticks.length);
+      ticks.forEach((t, k) => (st[k] = k === 0 || Number(t.arrays.get("episode_starts")?.data[0] ?? 0) ? 1 : 0));
+      rec.set("episode_starts", { dtype: "u1", shape: [ticks.length], data: st });
+      for (const s of plan.states) {
+        const v = ticks[0].stateIn?.get(s.input);
+        if (v) rec.set(`init_${s.input}`, { dtype: "f4", shape: [v.length], data: v.slice() });
+      }
+    }
+    rec.set("fps", { dtype: "f8", shape: [], data: Float64Array.of(hz) });
+    return rec;
+  }
+
   function schedule() {
     if (busy) return;
     const wait = Math.max(0, lastUpdate + interval - performance.now());
@@ -285,7 +313,7 @@ export function initLive(host: LiveHost) {
   async function runTicks(ticks: Tick[]) {
     const p = plan!;
     const fixed = (d: number | string | undefined) => (typeof d === "number" && d > 0 ? d : 0);
-    const B = Math.max(0, ...p.inputs.map((i) => fixed(i.shape[0]))) === 1 ? 1 : 64;
+    const B = Math.max(0, ...p.inputs.map((i) => fixed(i.shape[0]))) === 1 || p.states.length ? 1 : 64;
     for (let s = 0; s < ticks.length; s += B) {
       const chunk = ticks.slice(s, s + B);
       const feeds: Record<string, ort.Tensor> = {};
@@ -300,16 +328,31 @@ export function initLive(host: LiveHost) {
         const size = nd.shape.slice(1).reduce((a, b) => a * b, 1);
         feeds[inp.name] = makeInput(inp.elemType, nd, 0, chunk.length, size, [chunk.length, ...tickShape]);
       }
+      // recurrent: one tick per run; the state goes back to its initial value at an episode start. A viewer that joins
+      // mid-episode takes the state Python fed into that tick (init_<input>), else starts from zeros.
+      const t = chunk[0];
+      for (const st of p.states) {
+        const sent = t.arrays.get(`init_${st.input}`);
+        const isStart = !!Number(t.arrays.get("episode_starts")?.data[0] ?? 0);
+        if (isStart || !state.has(st.input)) {
+          const v = new Float32Array(st.size);
+          if (sent && sent.data.length === st.size) for (let i = 0; i < st.size; i++) v[i] = Number(sent.data[i]);
+          state.set(st.input, v);
+        }
+        (t.stateIn ??= new Map()).set(st.input, state.get(st.input)!);
+        feeds[st.input] = new ort.Tensor("float32", state.get(st.input)!.slice(), st.dims);
+      }
       const res = await session!.run(feeds, p.fetch);
+      for (const st of p.states) state.set(st.input, Float32Array.from(res[st.output].data as Float32Array));
       for (const name of p.fetch) {
         const r = res[name];
-        const per = r.dims.slice(1).reduce((a, b) => a * Number(b), 1);
+        const per = r.data.length / chunk.length;
         const src = r.data as ArrayLike<number | bigint>;
         chunk.forEach((t, k) => {
           const a = new Float32Array(per);
           for (let j = 0; j < per; j++) a[j] = Number(src[k * per + j]);
           (t.trace ??= new Map()).set(name, a);
-          (t.dims ??= new Map()).set(name, r.dims.slice(1).map(Number));
+          (t.dims ??= new Map()).set(name, p.tickDims.get(name) ?? r.dims.slice(1).map(Number));
         });
       }
     }
@@ -325,11 +368,7 @@ export function initLive(host: LiveHost) {
     if (win.length > W) win = win.slice(win.length - W);
     // the window as an ordinary recording + trace
     const rec = new Map<string, NdArray>();
-    for (const key of win[win.length - 1].arrays.keys()) {
-      const parts = win.map((t) => t.arrays.get(key));
-      if (parts.every((x) => x && x.data.length === parts[0]!.data.length)) rec.set(key, stack(parts as NdArray[]));
-    }
-    rec.set("fps", { dtype: "f8", shape: [], data: Float64Array.of(hz) });
+    for (const [k, v] of asRecording(win)) rec.set(k, v);
     const tensors: Trace["tensors"] = new Map();
     const dims0 = win[0].dims!;
     for (const name of plan.fetch) {
@@ -343,6 +382,12 @@ export function initLive(host: LiveHost) {
     S.obsList = plan.inputs.map((i) => rec.get(`obs_${i.name}`) ?? rec.get("obs")!);
     S.obs = S.obsList[Math.max(0, plan.inputs.findIndex((i) => i.isImage))];
     S.trace = { tensors, T: win.length, ms: performance.now() - t0 };
+    if (plan.states.length) {
+      // the window replays exactly: it starts from the state its first tick was fed (trace.init / init_<input>)
+      S.trace.starts = rec.get("episode_starts")!.data as Uint8Array;
+      S.trace.init = new Map(plan.states.map((st) => [st.input, win[0].stateIn!.get(st.input)!]));
+    }
+    if (S.cmp) S.cmp.trace = null; // compare: the second model reruns on each new window
     S.hz = hz;
     if (first) {
       first = false;
@@ -398,13 +443,7 @@ export function initLive(host: LiveHost) {
     recBtn.textContent = "Record";
     recBtn.setAttribute("aria-pressed", "false");
     if (!recTicks.length) return;
-    const arrays = new Map<string, NdArray>();
-    for (const key of recTicks[0].arrays.keys()) {
-      const parts = recTicks.map((t) => t.arrays.get(key));
-      if (parts.every((x) => x && x.data.length === parts[0]!.data.length)) arrays.set(key, stack(parts as NdArray[]));
-    }
-    arrays.set("fps", { dtype: "f8", shape: [], data: Float64Array.of(hz) });
-    const blob = writeNpz(arrays);
+    const blob = writeNpz(asRecording(recTicks));
     const n = recTicks.length;
     recTicks = [];
     recBytes = 0;

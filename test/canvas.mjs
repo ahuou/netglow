@@ -4,7 +4,7 @@ import { writeFileSync } from "node:fs";
 const [which, out, extra = ""] = process.argv.slice(2);
 const b = await chromium.launch();
 const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
-await p.goto("http://localhost:5181/?demo=none");
+await p.goto(process.env.URL ?? "http://localhost:5181/?demo=none");
 if (which.startsWith("demo:")) await p.click(`#demoList [data-demo="${which.slice(5)}"]`);
 else { await p.setInputFiles("#fileModel", `test/fixtures/${which}.onnx`); await p.setInputFiles("#fileRec", `test/fixtures/${which}.npz`); }
 await p.waitForFunction(() => window.netglow?.S?.viz);

@@ -1,7 +1,7 @@
 // Headless smoke test: load fixtures or a demo, check the match, screenshot. usage: node test/smoke.mjs [mlp|cnn|demo:<id>] [url]
 import { chromium } from "@playwright/test";
 const which = process.argv[2] ?? "mlp";
-const url = process.argv[3] ?? "http://localhost:5181/?demo=none";
+const url = process.argv[3] ?? process.env.URL ?? "http://localhost:5181/?demo=none";
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, acceptDownloads: true });
 const logs = [];
