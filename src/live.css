@@ -1,0 +1,12 @@
+/* Live section in the left panel (built by live.ts) */
+.live-form { display: grid; grid-template-columns: minmax(0, 1fr); justify-items: start; gap: 6px; }
+.live-form input[type="text"] {
+  width: 100%; min-width: 0; height: 28px; padding: 0 8px; border-radius: 4px; border: 1px solid var(--control);
+  background: var(--raised); font-family: var(--mono); font-size: var(--fs-small);
+}
+.live-form input[type="text"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#liveInfo { overflow-wrap: anywhere; }
+#liveInfo code { font-family: var(--mono); color: var(--muted); }
+.live-saved { color: var(--faint); font-size: var(--fs-small); align-self: center; }
+.live-saved a { color: var(--muted); }
+#liveRec[aria-pressed="true"] { border-color: var(--accent); color: var(--text); }

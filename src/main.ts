@@ -16,6 +16,7 @@ import { Renderer, THEMES, type Labels, type Theme } from "./render";
 import { runExport, type ExportFormat } from "./export";
 import { imageView, type ImageSettings, type ImageView } from "./image";
 import { DEFAULT_STYLE, type PicPos, type Style } from "./render";
+import { initLive } from "./live";
 import { DEFAULT_SETTINGS, clearStored, clone, diff, fromHash, loadStored, merge, store, toHash, type Settings } from "./settings";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -823,11 +824,14 @@ $("exportTop").addEventListener("click", doExport);
 $("exportCancel").addEventListener("click", () => S.exportAbort?.abort());
 window.addEventListener("resize", () => drawRibbon());
 
-// test / automation hook
-(window as unknown as { netglow: unknown }).netglow = { S, loadDemo, handleFiles, redraw, play, stop };
+// live mode (src/live.ts): streamed ticks become a rolling recording + trace, drawn through rebuild()
+const live = initLive({ S, loadModel: async (b, n) => (await loadModelBytes(b, n), applySaved()), rebuild, redraw, stop, status, markFile });
 
-// first open: load the MLP demo so the page shows a live network straight away (?demo=none keeps it empty)
-const q = new URLSearchParams(location.search).get("demo") ?? "lunar-mlp";
+// test / automation hook
+(window as unknown as { netglow: unknown }).netglow = { S, loadDemo, handleFiles, redraw, play, stop, live };
+
+// first open: load the MLP demo so the page shows a live network straight away (?demo=none or ?live=… keeps it empty)
+const q = new URLSearchParams(location.search).get("demo") ?? (new URLSearchParams(location.search).has("live") ? "none" : "lunar-mlp");
 if (q !== "none")
   loadDemo(q).then(() => {
     if (S.viz && !matchMedia("(prefers-reduced-motion: reduce)").matches && !new URLSearchParams(location.search).has("paused")) play();

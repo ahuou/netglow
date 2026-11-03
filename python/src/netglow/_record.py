@@ -12,6 +12,7 @@ frames     the env's own render (rgb), shown beside the network; optional.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import time
@@ -153,6 +154,7 @@ class Recorder:
     obs per tick  an array, a tuple of arrays (forward's positional order) or a dict {name: array}.
     output        raw model output for that tick; computed with the model when omitted.
     live          stream every tick to the viewer over a localhost WebSocket (see netglow.live).
+    keep          ticks kept in memory for save(): all by default, the last 2000 when live with no out_dir.
     """
 
     def __init__(
@@ -171,6 +173,7 @@ class Recorder:
         frame_width: int = 240,
         quiet: bool = False,
         web: str | None = None,
+        keep: int | None = None,
     ):
         from ._sb3 import from_sb3, is_sb3
 
@@ -184,7 +187,8 @@ class Recorder:
         self.output_mode = output_mode or getattr(self.model, "output_mode", None)
         self.frame_width = frame_width
         self.quiet = quiet
-        self.ticks: list[dict] = []
+        # every tick when writing files; a live-only session keeps the last 2000 so memory stays flat
+        self.ticks: collections.deque[dict] = collections.deque(maxlen=keep if keep else (None if out_dir or not live else 2000))
         self.onnx: bytes | None = None
         self.server = None
         if live:

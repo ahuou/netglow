@@ -65,18 +65,72 @@ npm run dev          # http://localhost:5173
 Click **LunarLander, MLP** under Demos. Press space to play, drag the input or output rows on the canvas to
 reorder them, then **Export**.
 
-To use your own policy:
-
-```bash
-cd python && uv venv && uv pip install -r requirements.txt
-python export_recording.py --sb3 my_ppo.zip --env LunarLander-v3 --out my_run
-```
-
-and drop `my_run/model.onnx`, `my_run/recording.npz` and `my_run/labels.json` (plus icons) on the page.
-For a plain torch module, see `python/export_recording.py` (`export_onnx`, `save_recording`).
+To use your own policy, see [From Python](#from-python) below.
 
 `npm run build` produces a static `dist/` you can host anywhere (relative paths, no server code). The live site is
 built by `.github/workflows/pages.yml` on every push to `main` (with `NETGLOW_BASE=/netglow/`).
+
+## From Python
+
+```bash
+pip install "git+https://github.com/ahuou/netglow#subdirectory=python"   # needs torch; SB3 + gymnasium for record
+```
+
+```python
+import netglow
+
+netglow.export(net, torch.zeros(8), "run/model.onnx")                 # any torch module; tuple / dict for several inputs
+netglow.record("ppo.zip", "LunarLander-v3", steps=600, out_dir="run")  # SB3 policy + Gymnasium env -> run/
+
+rec = netglow.Recorder(net, out_dir="run", fps=50)                     # any loop, no Gymnasium needed
+for obs, a in my_loop():
+    rec.add(obs, action=a)                                             # outputs computed with net when not given
+rec.save()                                                             # run/model.onnx, recording.npz, labels.json
+```
+
+```bash
+netglow record --sb3 ppo.zip --env LunarLander-v3 --steps 600 --out run
+netglow export --sb3 ppo.zip -o model.onnx
+```
+
+Then drop the three files from `run/` on the page.
+
+- `netglow.from_sb3(zip_or_model)`: the deterministic policy net of PPO / A2C (logits or mean action), DQN (Q-values),
+  SAC (`tanh(mu)`) or TD3. `Dict` observation spaces become one ONNX input per key (an image lane plus numbers).
+- `record` takes the executed action from SB3's `predict(deterministic=True)`, so the match check compares against
+  what the env really got. It stores the env render (240 px wide) and names inputs / outputs for common envs
+  (LunarLander, CartPole, Acrobot, MountainCar, Pendulum).
+- `obs` per tick: an array, a tuple (forward's order) or a dict `{input name: array}`. float64 is stored as float32.
+
+## Live mode
+
+Stream a running policy into the page: the model goes over a localhost WebSocket once, then each tick's inputs. The
+page runs the model on every tick as it arrives and animates the last ~10 s.
+
+```python
+rec = netglow.live(net, port=8765)       # or Recorder(net, live=True), or record(..., live=True)
+while running:
+    out = rec.infer(obs)                 # the policy's output, which the browser reproduces
+    rec.add(obs, output=out, action=act(out))
+```
+
+```bash
+python examples/live_gym.py --sb3 ppo.zip --env LunarLander-v3   # no args: trains a quick CartPole PPO first
+netglow record --sb3 ppo.zip --env LunarLander-v3 --live          # paced at the env's fps
+```
+
+Open one of the two links it prints:
+
+- `https://ahuou.github.io/netglow/?live=8765`: the hosted page connects to `ws://localhost:8765`. Chrome treats that
+  as local network access from a public site and asks once (headless Chromium 156: refused without the permission,
+  connects with it). Firefox allows `ws://localhost` from https. Safari may block it.
+- `http://localhost:8765/`: the same port also serves the viewer (a cached copy of the hosted page, or a local build
+  via `--dist dist/` / `NETGLOW_WEB`), so no browser asks anything. `netglow serve` serves just the viewer.
+
+In the page, **Live** (left panel) takes a `ws://` address or a port and reconnects if Python restarts.
+**Record** keeps what streams in from then on; **Stop and save** downloads it as an ordinary `recording.npz` (with a
+link to the model). **Disconnect** leaves the last window loaded for scrubbing and export. Normalisation and node
+selection use only the window, so brightness is relative to the last few seconds.
 
 ## Settings
 
@@ -211,7 +265,10 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | `src/image.ts` | turning an image input tensor back into pixels (range, gray / RGB, frame stack) |
 | `src/export.ts` | GIF (gifenc) and WebCodecs video (mediabunny) |
 | `src/io/npy.ts` | `.npy` / `.npz` (zip + DecompressionStream) / JSON readers |
-| `python/` | demo training and `export_recording.py` |
+| `src/io/npz-write.ts` | writing `.npz` (stored zip) when saving a live stream |
+| `src/live.ts` | live mode: WebSocket client, per-tick model run, rolling window, record and save |
+| `python/src/netglow/` | the Python package: export, SB3 extraction, `record` / `Recorder`, live server, CLI |
+| `python/` | also demo training (`train_demos.py`) and the older `export_recording.py` |
 
 ## License
 
@@ -229,4 +286,10 @@ node test/image.mjs            # image node, AI view, feature maps, pixel-range 
 node test/drag.mjs             # drag and keyboard reorder
 node test/settings.mjs         # sizes and look change the render and the export; persist, reset, JSON, share link
 node test/export.mjs mlp gif out.gif
+```
+
+Python package (starts its own vite server, or uses `NETGLOW_URL`; every folder it writes is loaded in the real app):
+
+```bash
+cd python && uv pip install -e ".[test]" && pytest   # torch MLP / CNN / two inputs, SB3 PPO / DQN / SAC / Dict, CLI, live
 ```

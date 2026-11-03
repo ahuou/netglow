@@ -1,6 +1,25 @@
-# netglow / python
+# netglow (Python)
 
-Builds the bundled demos and exports your own policies for the netglow viewer.
+Export a PyTorch or Stable-Baselines3 policy and what it sees for [netglow](https://ahuou.github.io/netglow/), the
+in-browser "glowing network" viewer, or stream it into the page live.
+
+```bash
+pip install "git+https://github.com/ahuou/netglow#subdirectory=python"   # install torch first (CPU wheel is enough)
+```
+
+```python
+import netglow
+netglow.export(net, torch.zeros(8), "run/model.onnx")                  # torch module -> ONNX the viewer reads
+netglow.record("ppo.zip", "LunarLander-v3", steps=600, out_dir="run")   # SB3 + Gymnasium -> run/{model.onnx, recording.npz, labels.json}
+rec = netglow.Recorder(net, out_dir="run"); rec.add(obs); rec.save()    # any loop
+rec = netglow.live(net); rec.add(obs)                                   # stream to the browser, tick by tick
+```
+
+CLI: `netglow record --sb3 ppo.zip --env LunarLander-v3 [--live]`, `netglow export --sb3 ppo.zip`, `netglow serve`.
+See the main README's "From Python" and "Live mode" sections. Tests: `pip install -e ".[test]" && pytest`
+(needs `npm install` at the repo root; every folder the tests write is loaded in the real web app).
+
+This folder also builds the bundled demos (`train_demos.py`) with the older standalone `export_recording.py`.
 
 ## Setup
 

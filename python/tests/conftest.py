@@ -14,6 +14,13 @@ from pathlib import Path
 
 import pytest
 
+try:  # one sample per call: extra threads only add contention (a 0.1 ms CNN took 100 ms on 24 busy threads)
+    import torch
+
+    torch.set_num_threads(1)
+except ImportError:
+    pass
+
 REPO = Path(__file__).resolve().parents[2]
 
 

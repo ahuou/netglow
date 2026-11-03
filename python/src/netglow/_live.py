@@ -42,7 +42,7 @@ def encode_tick(i: int, tick: dict) -> bytes:
     arrays, blobs = [], []
 
     def add(key: str, a: Any):
-        a = np.ascontiguousarray(a)
+        a = np.asarray(a, order="C")  # not ascontiguousarray: that turns a scalar action into shape (1,)
         if a.dtype == np.float64:
             a = a.astype(np.float32)
         if a.dtype == np.bool_:

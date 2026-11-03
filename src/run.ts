@@ -15,7 +15,7 @@ export interface Trace {
   ms: number;
 }
 
-function makeInput(elem: number, src: NdArray, start: number, count: number, size: number, shape: number[]): ort.Tensor {
+export function makeInput(elem: number, src: NdArray, start: number, count: number, size: number, shape: number[]): ort.Tensor {
   const n = count * size;
   const off = start * size;
   const d = src.data;
