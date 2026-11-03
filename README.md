@@ -4,6 +4,9 @@ Drop in a neural network and a recording of its inputs, and get an animated "glo
 **real** activations, tick by tick. Everything runs in your browser tab: the model, the recording and the
 video never leave your machine.
 
+**Try it: [ahuou.github.io/netglow](https://ahuou.github.io/netglow/)** (demos: [MLP](https://ahuou.github.io/netglow/?demo=lunar-mlp),
+[CNN](https://ahuou.github.io/netglow/?demo=lunar-cnn), [pixels + numbers](https://ahuou.github.io/netglow/?demo=lunar-mixed)).
+
 ![netglow showing a LunarLander PPO policy](docs/screenshot.png)
 
 - **Inputs** on the left: label, live value; node colour = how fast that input is changing.
@@ -38,7 +41,7 @@ video never leave your machine.
 
 ### Mixed inputs: an image and plain numbers
 
-![netglow showing a LunarLander pilot that reads two inputs: frames and six numbers](docs/screenshot-mixed.png)
+![netglow animating a LunarLander pilot that reads two inputs, frames and six numbers](docs/mixed.gif)
 
 - Models with several ONNX inputs, e.g. `frames` `[N, C, H, W]` and `vector` `[N, D]`, each running through its
   own branch (a conv stack, dense layers, or nothing at all) and joined by one `Concat` before the dense head.
@@ -72,7 +75,8 @@ python export_recording.py --sb3 my_ppo.zip --env LunarLander-v3 --out my_run
 and drop `my_run/model.onnx`, `my_run/recording.npz` and `my_run/labels.json` (plus icons) on the page.
 For a plain torch module, see `python/export_recording.py` (`export_onnx`, `save_recording`).
 
-`npm run build` produces a static `dist/` you can host anywhere (relative paths, no server code).
+`npm run build` produces a static `dist/` you can host anywhere (relative paths, no server code). The live site is
+built by `.github/workflows/pages.yml` on every push to `main` (with `NETGLOW_BASE=/netglow/`).
 
 ## Settings
 
