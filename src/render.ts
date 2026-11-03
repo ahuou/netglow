@@ -119,6 +119,58 @@ const hex = (h: string): RGB => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3
 const mix = (a: RGB, b: RGB, t: number) => `rgb(${Math.round(a[0] + (b[0] - a[0]) * t)},${Math.round(a[1] + (b[1] - a[1]) * t)},${Math.round(a[2] + (b[2] - a[2]) * t)})`;
 const rgba = (c: RGB, a: number) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 
+/** a placed column title: drawn left-aligned at (x0, y), and its bounding box */
+export interface TitleBox {
+  text: string;
+  x0: number;
+  x1: number;
+  y: number;
+  y0: number;
+  y1: number;
+}
+
+/**
+ * Place labels in one row without overlap, each as close as possible to its wanted centre.
+ * Least-squares with ordering constraints: substitute y_i = x_i - (widths and gaps before i), the constraint
+ * "label i+1 starts after label i ends" becomes y nondecreasing, solved exactly by pool-adjacent-violators;
+ * then the whole row is clipped into [lo, hi]. Labels keep their input order; returns left edges.
+ */
+function spread(cx: number[], w: number[], gap: number, lo: number, hi: number): number[] {
+  const n = cx.length;
+  const pre: number[] = [];
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    pre.push(acc);
+    acc += w[i] + gap;
+  }
+  const total = acc - gap;
+  // blocks of pooled values: [mean target, count]
+  const blocks: [number, number][] = [];
+  for (let i = 0; i < n; i++) {
+    blocks.push([cx[i] - w[i] / 2 - pre[i], 1]);
+    while (blocks.length > 1 && blocks[blocks.length - 2][0] > blocks[blocks.length - 1][0]) {
+      const [v2, c2] = blocks.pop()!;
+      const [v1, c1] = blocks.pop()!;
+      blocks.push([(v1 * c1 + v2 * c2) / (c1 + c2), c1 + c2]);
+    }
+  }
+  const ys: number[] = [];
+  for (const [v, c] of blocks) for (let j = 0; j < c; j++) ys.push(Math.min(Math.max(v, lo), Math.max(lo, hi - total)));
+  return ys.map((y, i) => y + pre[i]);
+}
+
+/** cut text with "…" until it fits maxW */
+function ellipsize(ctx: CanvasRenderingContext2D, t: string, maxW: number): string {
+  if (ctx.measureText(t).width <= maxW) return t;
+  let a = 0, b = t.length;
+  while (a < b) {
+    const mid = (a + b + 1) >> 1;
+    if (ctx.measureText(t.slice(0, mid).trimEnd() + "…").width <= maxW) a = mid;
+    else b = mid - 1;
+  }
+  return a ? t.slice(0, a).trimEnd() + "…" : "…";
+}
+
 export interface Hit {
   col: number;
   slot: number;
@@ -142,6 +194,9 @@ export class Renderer {
   /** image node thumbnail [x, y, w, h] */
   imgRect: [number, number, number, number] | null = null;
   private headerY = 40;
+  /** column titles as last drawn (for tests and hit checks); never overlapping */
+  titleBoxes: TitleBox[] = [];
+  private bandTop = 0;
   private textX = 28;
 
   constructor(public viz: Viz, public labels: Labels, public opt: RenderOpts) {}
@@ -226,6 +281,7 @@ export class Renderer {
       this.pics.push({ kind: p.kind, x, y, w, h, caption: p.caption, corner: true });
     }
     this.headerY = topBand + m + 12 * s;
+    this.bandTop = topBand;
     const top = topBand + m + 58 * s;
     const bot = H - m - 12 * s;
     // image node size (image models): the frame at a size where its pixels are visible
@@ -270,6 +326,90 @@ export class Renderer {
     return s;
   }
 
+  /**
+   * Column titles centred on their columns when they fit; when columns are squeezed or the canvas is crowded,
+   * first nudge them apart (as little as possible, least squares), then alternate them over two rows if a nudge
+   * exceeds 20 px, then shrink the font,
+   * and finally cut the longest ones with "…". Sets ctx.font to the chosen size.
+   */
+  private placeTitles(ctx: CanvasRenderingContext2D, s: number): TitleBox[] {
+    const W = this.opt.width;
+    const items = this.viz.cols
+      // kept in column order, even when squeezed columns cross: the titles then still read input -> output
+      .map((c, ci) => ({ text: c.label, cx: this.X[ci] + (c.kind === "output" ? 40 * s : ci === 0 && this.imgRect ? -this.imgRect[2] / 2 : 0) }));
+    if (!items.length) return [];
+    const gap = 14 * s;
+    const lo = 6 * s, hi = W - 6 * s;
+    const font = (px: number) => `500 ${px}px "Public Sans", system-ui, sans-serif`;
+    const f0 = 15 * s;
+    // how far a layout moves titles off their columns (0 = all centred, no overlap)
+    const solve = (px: number, rows: number) => {
+      ctx.font = font(px);
+      const w = items.map((t) => ctx.measureText(t.text).width);
+      const x = new Array<number>(items.length);
+      let worst = 0;
+      let fits = true;
+      for (let r = 0; r < rows; r++) {
+        const idx = items.map((_, i) => i).filter((i) => i % rows === r);
+        const ws = idx.map((i) => w[i]);
+        if (ws.reduce((a, b) => a + b, 0) + gap * (idx.length - 1) > hi - lo) fits = false;
+        const xs = spread(idx.map((i) => items[i].cx), ws, gap, lo, hi);
+        idx.forEach((i, k) => {
+          x[i] = xs[k];
+          worst = Math.max(worst, Math.abs(xs[k] + w[i] / 2 - items[i].cx));
+        });
+      }
+      return { px, rows, w, x, worst, fits };
+    };
+    // one row unless that pushes a title more than 20 px off its column
+    let best = solve(f0, 1);
+    if (best.worst > 20 * s) {
+      const two = solve(f0, 2);
+      if (two.worst < best.worst) best = two;
+    }
+    // too wide even when nudged apart: shrink, down to 70 %
+    for (let px = f0 * 0.9; !best.fits && px >= f0 * 0.7 - 1e-6; px -= f0 * 0.1) {
+      const one = solve(px, 1);
+      const two = solve(px, 2);
+      best = one.fits && one.worst <= two.worst ? one : two;
+    }
+    ctx.font = font(best.px);
+    let { w, x } = best;
+    const texts = items.map((t) => t.text);
+    if (!best.fits) {
+      // still too wide: cap every title at one shared width (longest ones get cut), then place again
+      for (let r = 0; r < best.rows; r++) {
+        const idx = items.map((_, i) => i).filter((i) => i % best.rows === r);
+        const room = hi - lo - gap * (idx.length - 1);
+        const sorted = idx.map((i) => w[i]).sort((a, b) => a - b);
+        let cap = room / idx.length;
+        let used = 0;
+        for (let k = 0; k < sorted.length; k++) {
+          const c = (room - used) / (sorted.length - k);
+          if (sorted[k] > c) {
+            cap = c;
+            break;
+          }
+          used += sorted[k];
+          cap = Infinity;
+        }
+        for (const i of idx) {
+          texts[i] = ellipsize(ctx, texts[i], cap);
+          w[i] = ctx.measureText(texts[i]).width;
+        }
+        const xs = spread(idx.map((i) => items[i].cx), idx.map((i) => w[i]), gap, lo, hi);
+        idx.forEach((i, k) => (x[i] = xs[k]));
+      }
+    }
+    // second row goes above the first when there is room, else below it
+    const line = best.px * 1.3;
+    const up = this.headerY - line - best.px / 2 >= this.bandTop + 4 * s;
+    return items.map((_, i) => {
+      const y = this.headerY + (i % best.rows === 1 ? (up ? -line : line) : 0);
+      return { text: texts[i], x0: x[i], x1: x[i] + w[i], y, y0: y - best.px / 2, y1: y + best.px / 2 };
+    });
+  }
+
   /** draw recording time tRec (seconds); dt = seconds of wall/video time since the previous frame (0 = snap) */
   draw(ctx: CanvasRenderingContext2D, tRec: number, dt: number) {
     const o = this.opt;
@@ -303,11 +443,11 @@ export class Renderer {
     }
 
     // column headings
-    ctx.font = `500 ${15 * s}px "Public Sans", system-ui, sans-serif`;
-    ctx.textAlign = "center";
+    ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.fillStyle = th.dim;
-    if (st.titles) viz.cols.forEach((c, ci) => ctx.fillText(c.label, this.X[ci] + (c.kind === "output" ? 40 * s : ci === 0 && this.imgRect ? -this.imgRect[2] / 2 : 0), this.headerY));
+    this.titleBoxes = st.titles ? this.placeTitles(ctx, s) : [];
+    for (const t of this.titleBoxes) ctx.fillText(t.text, t.x0, t.y);
 
     // pulse: sweep once per decision tick, or once per m ticks when ticks come faster than ~4 frames
     const ticksPerSec = o.hz * o.speed;

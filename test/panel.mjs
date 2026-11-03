@@ -16,4 +16,15 @@ await p.evaluate(() => { const n = window.netglow; n.S.t = 2.3; n.redraw(0); });
 const png = await p.evaluate(() => document.getElementById("view").toDataURL());
 (await import("node:fs")).writeFileSync("test/shots/custom-look-canvas.png", Buffer.from(png.split(",")[1], "base64"));
 await p.screenshot({ path: "test/shots/custom-look.png" });
+// extreme: everything big, columns squeezed, pictures beside on both sides; column titles must still not overlap
+await set("aiScale", "1.4"); await set("nodeScale", "2.5"); await set("mapScale", "2.5");
+await set("imageScale", "2.5"); await set("colSpacing", "0.4"); await set("padding", "96"); await set("labelSize", "36"); await set("valueSize", "32");
+await p.evaluate(() => { const n = window.netglow; n.S.t = 2.3; n.redraw(0); });
+const boxes = await p.evaluate(() => window.netglow.S.renderer.titleBoxes ?? []);
+const over = boxes.some((a, i) => boxes.some((c, j) => j > i && a.x0 < c.x1 && c.x0 < a.x1 && a.y0 < c.y1 && c.y0 < a.y1));
+const ext = await p.evaluate(() => document.getElementById("view").toDataURL());
+(await import("node:fs")).writeFileSync("test/shots/extreme-look-canvas.png", Buffer.from(ext.split(",")[1], "base64"));
+await p.screenshot({ path: "test/shots/extreme-look.png" });
 await b.close();
+console.log(boxes.length && !over ? "PASS column titles do not overlap" : `FAIL column titles overlap (${boxes.length} boxes)`);
+if (!boxes.length || over) process.exitCode = 1;
