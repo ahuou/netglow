@@ -39,6 +39,21 @@ video never leave your machine.
   frames. **Newest frame**: last channels by default (first for stacks stored newest first). All three can
   be overridden in the View panel, which also says what was detected.
 
+### Saliency heatmap
+
+![netglow with a saliency heatmap over what the CNN pilot sees](docs/saliency.png)
+
+- Pictures → **Saliency heatmap**: gradient × input of the chosen output (the argmax; for "Values" outputs the
+  largest |output|), per pixel, summed over the channels of the frame stack, drawn over "What the AI sees" and
+  the image node. Warm = pushes the chosen output up, cool = down (the edge colours), alpha grows with the size.
+  **Heatmap opacity** sets its strength. It is part of every export.
+- The gradient is **exact**: onnxruntime-web has no autograd, so netglow runs its own reverse pass over the nodes
+  on the image path (`Conv`, `Gemm`, `MatMul`, ReLU / tanh / sigmoid masks from the real activations, max-pool
+  winners, average pools, batch norm, `Cast` / scaling, residual `Add`, `Concat` into a mixed head), at every
+  tick's real activations. `test/saliency.mjs` checks it against central finite differences in onnxruntime.
+- Colour scale: the 99th percentile of |grad × input| over the whole recording, so brightness is comparable
+  across ticks. Not available for recurrent models or ops outside that list (the View panel says so).
+
 ### Mixed inputs: an image and plain numbers
 
 ![netglow animating a LunarLander pilot that reads two inputs, frames and six numbers](docs/mixed.gif)
@@ -142,6 +157,7 @@ their row pitch, and when even that does not fit, the whole picture is scaled do
 | Layout and size | Column titles | on | toggle |
 | Pictures | What the AI sees: position, size | above, 1× | above, beside left / right, a corner (beside, aligned to the top or bottom), off; 0.3× to 2× |
 | Pictures | Recording: position, size | next to the AI view, 1× | same positions; 0.3× to 2× |
+| Pictures (image models) | Saliency heatmap, opacity | off, 0.8× | toggle; 0.1× to 1× |
 | Look | Glow | 1× | 0 to 3× |
 | Look | Decision pulse, strength | on, 1× | toggle, 0 to 5× |
 | Look | Node shape | circle | circle, square |
@@ -219,6 +235,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | Skip edges (`Add`) | **exact** split: identity `x[j]` into unit *j* (conv: channel mean), projection `P[j,i] · x[i]`; the block's own edges are its last layer's `W[j,i] · a[i]`. If a nonlinearity sits between that layer and the `Add`, the block edges are into that layer's pre-activation (a note says so) |
 | Edges into an LSTM / GRU column | **exact for the candidate gate only**: `W_c[j,i] · x[i]` into the pre-activation of the cell's new content (LSTM `c` gate, GRU `h` gate). The input, forget, output and update gates are not attributed; read them as "what pushes new content", not as a full decomposition of `h(t)` |
 | Recurrent loop edges | same quantity from the previous state: `R_c[j,k] · h(t−1)[k]` (GRU with `linear_before_reset`: times the reset gate `r_t[j]`, which netglow recomputes from the cell's weights). netglow also recomputes the whole cell in JS and checks it against onnxruntime's `h(t)` |
+| Saliency heatmap | **exact gradient × input** of the chosen output's logit (first-order: how much each pixel pushes it, at this tick's activations) |
 | Image node edges | **exact**, summed: the per-channel conv contributions of every channel in the stack, added up |
 | Through nonlinearities | **local**: contributions are into pre-activations; a ReLU that is off still draws its incoming edges. This is the linear part of the story, not a gradient through the whole network |
 | Node selection | heuristic: units with the largest mean |contribution| into the shown units of the next column, from the outputs backwards |
@@ -251,6 +268,7 @@ weights it reads out of the ONNX file and the intermediate tensors onnxruntime r
 | `src/compute.ts` | contributions, node selection, normalisation, match check |
 | `src/render.ts` | drawing one frame on a canvas, themes, image node, feature maps, hit-testing for drag |
 | `src/settings.ts` | the settings object: defaults, merge, localStorage, JSON and share-link hash |
+| `src/saliency.ts` | the reverse pass for the saliency heatmap (gradient × input) |
 | `src/image.ts` | turning an image input tensor back into pixels (range, gray / RGB, frame stack) |
 | `src/export.ts` | GIF (gifenc) and WebCodecs video (mediabunny) |
 | `src/io/npy.ts` | `.npy` / `.npz` (zip + DecompressionStream) / JSON readers |
@@ -268,6 +286,7 @@ the extra demos from `test/fixtures/demos_v2.py`):
 ```bash
 node test/smoke.mjs mlp        # also: cnn, rgbf, mixed, resmlp, rescnn, gated (expects a clear rejection), demo:lunar-mlp
 node test/recurrent.mjs        # LSTM / GRU: state threaded and reset, loop edges exact, cell recomputation, demo
+node test/saliency.mjs         # heatmap vs finite differences, overlay, opacity, in the export
 node test/residual.mjs         # skips: exact split at the Add, arcs over the block, no overlaps, rejection of gating
 node test/mixed.mjs            # two-input demo: match, lanes, edges from both branches, drag, short GIF
 node test/panel.mjs            # extreme sizes: no picture, label, title or column overlaps another

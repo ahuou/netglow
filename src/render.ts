@@ -16,6 +16,7 @@
 import type { Viz, VizColumn } from "./compute";
 import type { NdArray } from "./io/npy";
 import { frameRGBA, type ImageView } from "./image";
+import type { SaliencyMap } from "./saliency";
 
 /** where a picture goes: a band above the network, a column beside it, a corner inset, or nowhere.
  *  "auto" (recording only) = above when the AI view is above, else beside left */
@@ -48,12 +49,16 @@ export interface Style {
   shape: "circle" | "square";
   showValues: boolean;
   showProbs: boolean;
+  /** gradient × input heatmap over the AI view and the image node */
+  saliency: boolean;
+  saliencyOpacity: number;
 }
 
 export const DEFAULT_STYLE: Style = {
   nodeScale: 1, edgeMin: 1, edgeMax: 2.6, labelSize: 17, valueSize: 15, mapScale: 1, imageScale: 1,
   aiPos: "above", aiScale: 1, recPos: "auto", recScale: 1, colSpacing: 1, rowSpacing: 1, padding: 28, titles: true,
   glow: 1, pulse: true, pulseIntensity: 1, pos: "", neg: "", bg: "", shape: "circle", showValues: true, showProbs: true,
+  saliency: false, saliencyOpacity: 0.8,
 };
 
 export interface Theme {
@@ -103,6 +108,8 @@ export interface RenderOpts {
   image: ImageView | null;
   showMaps: boolean;
   style: Style;
+  /** image models: the saliency heatmap, when it is switched on and available */
+  saliency?: SaliencyMap | null;
 }
 
 interface Pic {
@@ -278,7 +285,8 @@ export class Renderer {
       const pos = st.recPos === "auto" ? (aiOn && st.aiPos === "above" ? "above" : "left") : st.recPos;
       want.push({ kind: "rec", w0: o.frames.shape[2], h0: o.frames.shape[1], caption: "Recording", pos, scale: st.recScale });
     }
-    if (aiOn) want.push({ kind: "ai", w0: o.image!.W, h0: o.image!.H, caption: `What the AI sees (${o.image!.W}×${o.image!.H})`, pos: st.aiPos, scale: st.aiScale });
+    const heatOn = st.saliency && !!o.saliency;
+    if (aiOn) want.push({ kind: "ai", w0: o.image!.W, h0: o.image!.H, caption: `What the AI sees (${o.image!.W}×${o.image!.H})${heatOn ? " · saliency" : ""}`, pos: st.aiPos, scale: st.aiScale });
     this.pics = [];
     let topBand = 0;
     const cols = this.viz.cols;
@@ -833,7 +841,10 @@ export class Renderer {
       ctx.fillStyle = th.dim;
       ctx.fillText(p.caption, p.x, p.y - 10 * s);
       if (p.kind === "rec") this.blitRecording(ctx, k, p.x, p.y, p.w, p.h);
-      else this.blitInput(ctx, k, 0, p.x, p.y, p.w, p.h);
+      else {
+        this.blitInput(ctx, k, 0, p.x, p.y, p.w, p.h);
+        this.drawHeat(ctx, k, p.x, p.y, p.w, p.h, C);
+      }
     }
 
     // column headings, after the pictures so a title is never hidden under one
@@ -966,6 +977,35 @@ export class Renderer {
     ctx.imageSmoothingEnabled = true;
   }
 
+  /** saliency overlay: warm = pushes the chosen output up, cool = down; alpha grows with |grad × input| */
+  private heatCanvas = document.createElement("canvas");
+  private drawHeat(ctx: CanvasRenderingContext2D, k: number, x: number, y: number, w: number, h: number, C: Record<string, RGB>) {
+    const sm = this.opt.saliency;
+    if (!sm || !this.opt.style.saliency) return;
+    const { H, W } = sm;
+    if (this.heatCanvas.width !== W || this.heatCanvas.height !== H) {
+      this.heatCanvas.width = W;
+      this.heatCanvas.height = H;
+    }
+    const hc = this.heatCanvas.getContext("2d")!;
+    const img = hc.createImageData(W, H);
+    const off = k * H * W;
+    const op = this.opt.style.saliencyOpacity;
+    for (let p = 0; p < H * W; p++) {
+      const v = sm.heat[off + p] / sm.scale;
+      const c = v > 0 ? C.pos : C.neg;
+      const a = Math.min(1, Math.abs(v)) ** 0.7;
+      img.data[p * 4] = c[0];
+      img.data[p * 4 + 1] = c[1];
+      img.data[p * 4 + 2] = c[2];
+      img.data[p * 4 + 3] = Math.round(255 * a * op);
+    }
+    hc.putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(this.heatCanvas, x, y, w, h);
+    ctx.imageSmoothingEnabled = true;
+  }
+
   private blitRecording(ctx: CanvasRenderingContext2D, k: number, x: number, y: number, w: number, h: number) {
     const f = this.opt.frames!;
     const [, fh, fw] = f.shape;
@@ -987,6 +1027,7 @@ export class Renderer {
 
   /** the input column of an image model: current frame, border lit by how much it changed, older stack frames below */
   private drawImageNode(ctx: CanvasRenderingContext2D, k: number, v: number, C: Record<string, RGB>, s: number, label: string) {
+    // (the heatmap goes over the thumbnail too, so a viewer without the big AI view still sees it)
     const [x, y, w, h] = this.imgRect!;
     const iv = this.opt.image!;
     const b = 3 * s;
@@ -998,6 +1039,7 @@ export class Renderer {
     ctx.fillStyle = mix(C.off, C.on, Math.min(1, v) ** 0.7);
     ctx.fillRect(x - b, y - b, w + 2 * b, h + 2 * b);
     this.blitInput(ctx, k, 0, x, y, w, h);
+    this.drawHeat(ctx, k, x, y, w, h, C);
     ctx.textAlign = "right";
     ctx.fillStyle = this.opt.theme.text;
     ctx.font = `600 ${this.opt.style.labelSize * s}px "Public Sans", system-ui, sans-serif`;

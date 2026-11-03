@@ -14,6 +14,7 @@
 //                    (initial_h, initial_c) and goes out as a graph output, and the run threads it from tick to tick
 
 import { ELEM, type ModelInfo, type NodeProto, type TensorProto } from "./onnx/proto";
+import { saliencyPath, type SaliencyPath } from "./saliency";
 
 export interface ConvGeom {
   kh: number;
@@ -128,6 +129,8 @@ export interface Plan {
   states: StateIO[];
   /** per-tick dims for tensors whose batch axis is not the first one (an LSTM's Y is [seq, dirs, N, H]) */
   tickDims: Map<string, number[]>;
+  /** image models: the path the saliency reverse pass walks (null without an image input) */
+  saliency: SaliencyPath | null;
 }
 
 const RESHAPE = new Set(["Reshape", "Flatten", "Squeeze", "Unsqueeze", "Identity", "Dropout"]);
@@ -406,7 +409,16 @@ export function buildPlan(m: ModelInfo): Plan {
     add(st.output);
   }
   add(graphOutput);
-  return { inputs, branches, merge, trunk, layers, outputTensor: last.actTensor, graphOutput, softmaxInGraph, warnings, fetch, skips, states, tickDims };
+  // saliency needs every tensor on the image path (activations for the masks, shapes for the convs)
+  const img = inputs.find((i) => i.isImage);
+  let saliency: SaliencyPath | null = null;
+  if (img) {
+    saliency = states.length
+      ? { input: img.name, nodes: [], fetch: [], error: "Saliency is not available for recurrent models (it would need gradients through time)." }
+      : saliencyPath(m, img.name, last.actTensor);
+    if (!saliency.error) saliency.fetch.forEach(add);
+  }
+  return { inputs, branches, merge, trunk, layers, outputTensor: last.actTensor, graphOutput, softmaxInGraph, warnings, fetch, skips, states, tickDims, saliency };
 }
 
 function weightedLayer(

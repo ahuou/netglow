@@ -16,6 +16,7 @@ import { Renderer, THEMES, type Labels, type Theme } from "./render";
 import { runExport, type ExportFormat } from "./export";
 import { imageView, type ImageSettings, type ImageView } from "./image";
 import { DEFAULT_STYLE, type PicPos, type Style } from "./render";
+import { computeSaliency, type SaliencyMap } from "./saliency";
 import { DEFAULT_SETTINGS, clearStored, clone, diff, fromHash, loadStored, merge, store, toHash, type Settings } from "./settings";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -75,6 +76,9 @@ const S = {
   imageView: null as ImageView | null,
   transparent: false,
   exportAbort: null as AbortController | null,
+  /** saliency heatmap of the current viz (computed when first switched on) */
+  sal: null as SaliencyMap | null,
+  salFor: null as Viz | null,
   lastUrl: "",
 };
 
@@ -351,13 +355,36 @@ function renderOpts() {
     hz: S.hz,
     speed: S.speed,
     fps: Number(($("fps") as HTMLSelectElement).value),
+    saliency: ensureSaliency(),
   };
+}
+
+/** gradient × input of the chosen output for every tick, computed once per viz when the heatmap is on */
+function ensureSaliency(): SaliencyMap | null {
+  const sp = S.plan?.saliency;
+  if (!S.style.saliency || !sp || sp.error || !S.viz || !S.trace || !S.model || !S.obs) return null;
+  if (S.salFor === S.viz && S.sal) return S.sal;
+  const V = S.viz;
+  const out = S.trace.tensors.get(S.plan!.outputTensor)!;
+  const target = new Int32Array(V.T);
+  for (let t = 0; t < V.T; t++) {
+    if (V.chosen) target[t] = V.chosen[t];
+    else {
+      let b = 0;
+      for (let i = 1; i < out.size; i++) if (Math.abs(out.data[t * out.size + i]) > Math.abs(out.data[t * out.size + b])) b = i;
+      target[t] = b;
+    }
+  }
+  S.sal = computeSaliency(S.model, sp, S.plan!.outputTensor, S.trace.tensors, toFloat(S.obs), S.obs.shape.slice(1), target);
+  S.salFor = V;
+  return S.sal;
 }
 
 function makeRenderer() {
   if (!S.viz || !S.labels) return;
   S.imageView = S.viz.imageInput && S.obs ? imageView(S.obs, S.img) : null;
-  $("imageDescribe").textContent = S.imageView ? `Reading the input as ${S.imageView.describe}.` : "";
+  const salErr = S.plan?.saliency?.error;
+  $("imageDescribe").textContent = S.imageView ? `Reading the input as ${S.imageView.describe}.${salErr ? ` ${salErr}` : ""}` : "";
   document.querySelectorAll<HTMLElement>(".image-only").forEach((el) => (el.hidden = !S.imageView));
   document.querySelectorAll<HTMLElement>(".maps-only").forEach((el) => (el.hidden = !S.viz!.cols.some((c) => c.maps)));
   const o = renderOpts();
@@ -875,6 +902,8 @@ const GROUPS: { title: string; ctls: Ctl[] }[] = [
       { key: "aiScale", label: "AI view size", type: "range", min: 0.3, max: 2, step: 0.05, unit: "×", only: "image" },
       { key: "recPos", label: "Recording", type: "select", options: [["auto", "Next to the AI view"], ...POS], only: "frames" },
       { key: "recScale", label: "Recording size", type: "range", min: 0.3, max: 2, step: 0.05, unit: "×", only: "frames" },
+      { key: "saliency", label: "Saliency heatmap (gradient × input)", type: "check", only: "image" },
+      { key: "saliencyOpacity", label: "Heatmap opacity", type: "range", min: 0.1, max: 1, step: 0.05, unit: "×", only: "image" },
     ],
   },
   {
@@ -1000,6 +1029,7 @@ function syncStyleUI() {
 function styleChanged() {
   if (S.renderer) {
     S.renderer.opt.style = S.style;
+    S.renderer.opt.saliency = ensureSaliency();
     redraw(0);
   }
   saveSoon();
