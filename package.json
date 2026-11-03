@@ -6,9 +6,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "predev": "node scripts/copy-ort.mjs",
     "dev": "vite",
-    "prebuild": "node scripts/copy-ort.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"

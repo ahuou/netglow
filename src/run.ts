@@ -6,7 +6,6 @@ import { ELEM, type ModelInfo, withExtraOutputs } from "./onnx/proto";
 import type { Plan } from "./analyze";
 import type { NdArray } from "./io/npy";
 
-ort.env.wasm.wasmPaths = new URL("ort/", document.baseURI).href;
 ort.env.wasm.numThreads = 1; // threads need cross-origin isolation, which plain static hosting lacks
 
 export interface Trace {
