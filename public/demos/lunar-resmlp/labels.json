@@ -1,0 +1,37 @@
+{
+  "title": "LunarLander · residual MLP",
+  "description": "A residual MLP (dense 64, then a block of two dense 64 layers with an identity skip around it) taught to imitate the PPO expert (behaviour cloning + DAgger). Landed 100% of 50 fresh seeds (mean return 270).",
+  "inputs": [
+    "x",
+    "y",
+    "x speed",
+    "y speed",
+    "angle",
+    "spin",
+    "left leg",
+    "right leg"
+  ],
+  "outputs": [
+    "nothing",
+    "left engine",
+    "main engine",
+    "right engine"
+  ],
+  "icons": [
+    "icons/noop.svg",
+    "icons/left.svg",
+    "icons/main.svg",
+    "icons/right.svg"
+  ],
+  "output_mode": "categorical",
+  "input_units": [
+    "",
+    "",
+    "",
+    "",
+    "rad",
+    "",
+    "0/1",
+    "0/1"
+  ]
+}

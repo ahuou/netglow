@@ -2,6 +2,8 @@
 import { chromium } from "@playwright/test";
 const url = process.env.URL ?? "http://localhost:5181/?demo=none";
 const b = await chromium.launch();
+// the first-visit legend is tested in polish.mjs; keep it out of these screenshots
+const _np = b.newPage.bind(b); b.newPage = async (o) => { const pg = await _np(o); await pg.addInitScript(() => localStorage.setItem("netglow:legend-seen:v1", "1")); return pg; };
 for (const [w, h] of [[1440, 900], [390, 844]]) {
   const p = await b.newPage({ viewport: { width: w, height: h } });
   await p.goto(url); await p.waitForTimeout(400);

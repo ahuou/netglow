@@ -17,6 +17,10 @@ import { runExport, type ExportFormat } from "./export";
 import { imageView, type ImageSettings, type ImageView } from "./image";
 import { DEFAULT_STYLE, type PicPos, type Style } from "./render";
 import { initLive } from "./live";
+import { computeSaliency, type SaliencyMap } from "./saliency";
+import { CompareRenderer, type CompareLayout } from "./compare";
+import type { RenderOpts } from "./render";
+import { legendHTML } from "./legend";
 import { DEFAULT_SETTINGS, clearStored, clone, diff, fromHash, loadStored, merge, store, toHash, type Settings } from "./settings";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -29,12 +33,33 @@ interface LabelsFile {
   icons?: (string | null)[];
   output_mode?: OutputMode;
   input_units?: (string | null)[] | null;
+  /** compare demos: a second model in the same folder, and names for the two panels */
+  compare?: { model: string; a?: string; b?: string };
+}
+
+/** the second model in compare mode, run on the same recording */
+interface Cmp {
+  model: ModelInfo;
+  plan: Plan;
+  name: string;
+  /** panel names */
+  a: string;
+  b: string;
+  obsList: NdArray[];
+  trace: Trace | null;
+  viz: Viz | null;
+  labels: Labels | null;
+  sal: SaliencyMap | null;
+  salFor: Viz | null;
 }
 
 const DEMOS = [
   { id: "lunar-mlp", title: "LunarLander, MLP", sub: "PPO policy reading 8 numbers" },
   { id: "lunar-cnn", title: "LunarLander, CNN", sub: "a CNN pilot that flies from pixels" },
   { id: "lunar-mixed", title: "LunarLander, pixels + numbers", sub: "two inputs: frames and 6 plain numbers" },
+  { id: "lunar-resmlp", title: "LunarLander, residual MLP", sub: "a skip connection around a two-layer block" },
+  { id: "lunar-lstm", title: "LunarLander, LSTM", sub: "never sees its speed, remembers it instead" },
+  { id: "lunar-compare", title: "LunarLander, early vs trained", sub: "two checkpoints of one policy, side by side" },
 ];
 
 const S = {
@@ -54,7 +79,9 @@ const S = {
   nameOverride: { inputs: new Map<number, string>(), outputs: new Map<number, string>() },
   trace: null as Trace | null,
   viz: null as Viz | null,
-  renderer: null as Renderer | null,
+  renderer: null as Renderer | CompareRenderer | null,
+  cmp: null as Cmp | null,
+  cmpLayout: "auto" as CompareLayout,
   labels: null as Labels | null,
   t: 0, // recording seconds
   playing: false,
@@ -74,7 +101,14 @@ const S = {
   imageView: null as ImageView | null,
   transparent: false,
   exportAbort: null as AbortController | null,
+  /** saliency heatmap of the current viz (computed when first switched on) */
+  sal: null as SaliencyMap | null,
+  salFor: null as Viz | null,
   lastUrl: "",
+  lastBlob: null as Blob | null,
+  lastExt: "",
+  /** the bundled demo on screen (null for the visitor's own files): embeds can point at it */
+  demoId: null as string | null,
 };
 
 const view = $<HTMLCanvasElement>("view");
@@ -94,6 +128,7 @@ function busy(on: boolean, text = "", f = 0) {
 
 // ---------- loading ----------
 async function loadModelBytes(bytes: Uint8Array, name: string) {
+  S.demoId = null;
   S.model = null;
   S.plan = null;
   S.modelName = name;
@@ -223,10 +258,14 @@ async function loadDemo(id: string) {
     );
     markFile("labels", "labels.json + icons");
     await loadModelBytes(m, `${id}/model.onnx`);
+    S.demoId = id;
     await loadRecording(rec, `${id}/recording.npz`);
     S.showFrame = !!S.rec?.get("frames");
     ($("showFrame") as HTMLInputElement).checked = S.showFrame;
     applySaved();
+    const cf = S.labelsFile?.compare;
+    S.cmp = cf ? newCmp(await get(cf.model), `${id}/${cf.model}`, cf.a, cf.b) : null;
+    syncCompareUI();
     await rebuild(true);
   } catch (e) {
     fail(e);
@@ -263,12 +302,13 @@ async function rebuild(rerun: boolean) {
       ($("mode") as HTMLSelectElement).value = S.mode;
     }
     busy(true, "Running the model in this tab…", 0);
-    S.trace = await runTrace(S.model, S.plan, S.obsList, (f) => busy(true, "Running the model in this tab…", f));
+    S.trace = await runTrace(S.model, S.plan, S.obsList, (f) => busy(true, "Running the model in this tab…", f), S.rec);
     busy(false);
   }
   const prev = S.viz ? { inputs: S.viz.cols.filter((c) => c.kind === "input").map((c) => c.order), output: S.viz.cols[S.viz.cols.length - 1].order } : undefined;
   S.viz = buildViz(S.plan, S.trace, S.rec, S.obsList, { nodesPerColumn: S.nodes, maxInputs: 24, mode: S.mode }, rerun ? undefined : prev);
   S.labels = resolveLabels();
+  if (S.cmp) await buildCompare(rerun);
   makeRenderer();
   const warn = S.plan.warnings.length ? ` Note: ${S.plan.warnings.join(" ")}` : "";
   status(`Ran ${S.trace.T} ticks in ${Math.round(S.trace.ms)} ms. ${S.plan.layers.length} weighted layers.${warn}`);
@@ -280,6 +320,8 @@ async function rebuild(rerun: boolean) {
   renderLabelsPanel();
   renderMatch();
   syncStyleUI();
+  renderLegend();
+  renderEmbed();
   $("empty").hidden = true;
   $("docTitle").textContent = S.labelsFile?.title ?? S.modelName.replace(/\.onnx$/, "");
   for (const id of ["play", "scrub", "exportBtn", "exportTop"]) ($(id) as HTMLButtonElement).disabled = false;
@@ -292,10 +334,9 @@ async function rebuild(rerun: boolean) {
   document.fonts?.ready.then(() => S.playing || redraw(0));
 }
 
-function resolveLabels(): Labels {
+function resolveLabels(viz: Viz = S.viz!, plan: Plan = S.plan!): Labels {
   const lf = S.labelsFile ?? {};
   const rec = S.rec!;
-  const viz = S.viz!;
   const nOut = viz.cols[viz.cols.length - 1].n;
   const recIn = rec.get("input_names")?.strings;
   const recOut = rec.get("output_names")?.strings;
@@ -306,7 +347,7 @@ function resolveLabels(): Labels {
   const inputs: string[] = new Array(nIn);
   for (const c of inCols) {
     const b = c.base ?? 0;
-    const tensor = S.plan!.inputs[c.input ?? 0].name;
+    const tensor = plan.inputs[c.input ?? 0].name;
     if (c.image) inputs[b] = S.nameOverride.inputs.get(b) ?? (multi ? (lf.inputs?.[b] ?? tensor) : "image");
     else
       for (let i = 0; i < c.n; i++)
@@ -350,19 +391,117 @@ function renderOpts() {
     hz: S.hz,
     speed: S.speed,
     fps: Number(($("fps") as HTMLSelectElement).value),
+    saliency: ensureSaliency(),
   };
+}
+
+// ---------- compare mode ----------
+function newCmp(bytes: Uint8Array, name: string, a?: string, b?: string): Cmp {
+  const model = parseModel(bytes);
+  const plan = buildPlan(model);
+  return { model, plan, name, a: a ?? "", b: b ?? "", obsList: [], trace: null, viz: null, labels: null, sal: null, salFor: null };
+}
+
+/** run the second model on the recording (when needed) and build its picture with the same options */
+async function buildCompare(rerun: boolean) {
+  const c = S.cmp!;
+  try {
+    if (rerun || !c.trace) {
+      c.obsList = resolveObs(c.plan, S.rec!);
+      busy(true, "Running the second model…", 0);
+      c.trace = await runTrace(c.model, c.plan, c.obsList, (f) => busy(true, "Running the second model…", f), S.rec!);
+      busy(false);
+      if (c.trace.T !== S.trace!.T) throw new Error(`it ran ${c.trace.T} ticks, the first model ${S.trace!.T}`);
+    }
+    const prev = c.viz ? { inputs: c.viz.cols.filter((x) => x.kind === "input").map((x) => x.order), output: c.viz.cols[c.viz.cols.length - 1].order } : undefined;
+    c.viz = buildViz(c.plan, c.trace, S.rec!, c.obsList, { nodesPerColumn: S.nodes, maxInputs: 24, mode: S.mode }, rerun ? undefined : prev);
+    c.labels = resolveLabels(c.viz, c.plan);
+  } catch (e) {
+    busy(false);
+    S.cmp = null;
+    syncCompareUI();
+    status(`Second model: ${e instanceof Error ? e.message : e}`, true);
+  }
+}
+
+function cmpSaliency(c: Cmp): SaliencyMap | null {
+  const sp = c.plan.saliency;
+  if (!S.style.saliency || !sp || sp.error || !c.viz || !c.trace) return null;
+  if (c.salFor === c.viz && c.sal) return c.sal;
+  const img = c.obsList[Math.max(0, c.plan.inputs.findIndex((i) => i.isImage))];
+  const target = new Int32Array(c.viz.T).map((_, t) => (c.viz!.chosen ? c.viz!.chosen[t] : 0));
+  c.sal = computeSaliency(c.model, sp, c.plan.outputTensor, c.trace.tensors, toFloat(img), img.shape.slice(1), target);
+  c.salFor = c.viz;
+  return c.sal;
+}
+
+/** the picture for render options o: one network, or the two compared ones */
+function makeDrawable(o: RenderOpts): Renderer | CompareRenderer {
+  const c = S.cmp;
+  if (!c?.viz || !c.labels) return new Renderer(S.viz!, S.labels!, o);
+  const imgB = c.viz.imageInput ? c.obsList[Math.max(0, c.plan.inputs.findIndex((i) => i.isImage))] : c.obsList[0];
+  const short = (n: string) => n.replace(/\.onnx$/, "").split("/").pop();
+  return new CompareRenderer(
+    { viz: S.viz!, labels: S.labels!, name: `A · ${c.a || short(S.modelName)}` },
+    { viz: c.viz, labels: c.labels, name: `B · ${c.b || short(c.name)}`, opt: { image: c.viz.imageInput ? imageView(imgB, S.img) : null, obs: imgB, saliency: cmpSaliency(c) } },
+    o, S.cmpLayout, matchMedia("(max-width: 700px)").matches,
+  );
+}
+
+function syncCompareUI() {
+  const on = !!S.cmp;
+  document.querySelectorAll<HTMLElement>(".compare-on").forEach((el) => (el.hidden = !on));
+  $("nameCompare").textContent = on ? S.cmp!.name : ".onnx, run on the same recording";
+  document.querySelector('.file-row[data-kind="compare"]')!.classList.toggle("loaded", on);
+  if (!on) $("cmpNote").textContent = "";
+}
+
+function renderCompareNote() {
+  const c = S.cmp;
+  if (!c?.viz || !(S.renderer instanceof CompareRenderer)) return;
+  const ag = S.renderer.agree.same;
+  const m = c.viz.match.argmax;
+  $("cmpNote").textContent =
+    (ag !== null ? `Same choice as A on ${Math.round(ag * 100)}% of the ${c.viz.T} ticks.` : "Values outputs: the strip shows how close they are.") +
+    (m ? ` B matches the logged actions on ${((100 * m.agree) / m.total).toFixed(1)}%.` : "");
+}
+
+/** gradient × input of the chosen output for every tick, computed once per viz when the heatmap is on */
+function ensureSaliency(): SaliencyMap | null {
+  const sp = S.plan?.saliency;
+  if (!S.style.saliency || !sp || sp.error || !S.viz || !S.trace || !S.model || !S.obs) return null;
+  if (S.salFor === S.viz && S.sal) return S.sal;
+  const V = S.viz;
+  const out = S.trace.tensors.get(S.plan!.outputTensor)!;
+  const target = new Int32Array(V.T);
+  for (let t = 0; t < V.T; t++) {
+    if (V.chosen) target[t] = V.chosen[t];
+    else {
+      let b = 0;
+      for (let i = 1; i < out.size; i++) if (Math.abs(out.data[t * out.size + i]) > Math.abs(out.data[t * out.size + b])) b = i;
+      target[t] = b;
+    }
+  }
+  S.sal = computeSaliency(S.model, sp, S.plan!.outputTensor, S.trace.tensors, toFloat(S.obs), S.obs.shape.slice(1), target);
+  S.salFor = V;
+  return S.sal;
 }
 
 function makeRenderer() {
   if (!S.viz || !S.labels) return;
   S.imageView = S.viz.imageInput && S.obs ? imageView(S.obs, S.img) : null;
-  $("imageDescribe").textContent = S.imageView ? `Reading the input as ${S.imageView.describe}.` : "";
+  const salErr = S.plan?.saliency?.error;
+  $("imageDescribe").textContent = S.imageView ? `Reading the input as ${S.imageView.describe}.${salErr ? ` ${salErr}` : ""}` : "";
   document.querySelectorAll<HTMLElement>(".image-only").forEach((el) => (el.hidden = !S.imageView));
   document.querySelectorAll<HTMLElement>(".maps-only").forEach((el) => (el.hidden = !S.viz!.cols.some((c) => c.maps)));
   const o = renderOpts();
-  view.width = o.width;
-  view.height = o.height;
-  S.renderer = new Renderer(S.viz, S.labels, o);
+  S.renderer = makeDrawable(o);
+  // a stacked comparison is taller than the chosen size
+  const [cw, ch] = S.renderer instanceof CompareRenderer ? [S.renderer.width, S.renderer.height] : [o.width, o.height];
+  view.width = cw;
+  view.height = ch;
+  $("well").style.setProperty("--canvas-ratio", `${cw} / ${ch}`);
+  renderCompareNote();
   // the canvas is the picture; say in words what it shows
   const ins = S.viz.cols.filter((c) => c.kind === "input").map((c) => (c.image ? `an image input (${S.labels!.inputs[c.base ?? 0]})` : `${c.sel.length} numbers`));
   view.setAttribute("aria-label", `Network activation view: ${ins.join(" and ")} through ${S.viz.cols.filter((c) => c.kind === "hidden").length} hidden layers to ${S.viz.cols[S.viz.cols.length - 1].sel.length} outputs. Reorder rows with Alt + arrow keys in the Inputs and Outputs lists.`);
@@ -449,7 +588,10 @@ function drawRibbon() {
   const out = viz.cols[viz.cols.length - 1];
   const n = out.sel.length;
   const misH = viz.match.mismatch ? 4 * devicePixelRatio : 0;
-  const rowH = (h - misH) / n;
+  // compare mode: a row on top, red where the two models choose differently
+  const agree = S.renderer instanceof CompareRenderer ? S.renderer.agree : null;
+  const agH = agree ? 5 * devicePixelRatio : 0;
+  const rowH = (h - misH - agH) / n;
   const on = S.theme.on;
   for (let x = 0; x < w; x++) {
     const t = Math.min(viz.T - 1, Math.floor((x / w) * viz.T));
@@ -459,7 +601,18 @@ function drawRibbon() {
       if (v < 0.04) continue;
       c.globalAlpha = Math.min(1, v);
       c.fillStyle = viz.chosen && viz.chosen[t] === out.sel[ii] ? on : "#9698a0";
-      c.fillRect(x, slot * rowH, 1, rowH - 1);
+      c.fillRect(x, agH + slot * rowH, 1, rowH - 1);
+    }
+    // episode starts (recurrent models reset their state there): a thin full-height mark
+    if (viz.starts && t > 0 && viz.starts[t] && Math.floor(((x - 1) / w) * viz.T) < t) {
+      c.globalAlpha = 0.9;
+      c.fillStyle = "#f0f0f0";
+      c.fillRect(x, 0, Math.max(1, devicePixelRatio), h);
+    }
+    if (agree && agree.v[t] < 0.5) {
+      c.globalAlpha = 1;
+      c.fillStyle = "#e5566f";
+      c.fillRect(x, 0, 1, agH - devicePixelRatio);
     }
     if (viz.match.mismatch && viz.match.mismatch[t]) {
       c.globalAlpha = 1;
@@ -476,6 +629,7 @@ function renderMatch() {
   const pill = $("matchPill");
   const rows: [string, string, boolean?][] = [];
   rows.push(["Ticks", String(S.viz!.T)]);
+  if (S.viz!.starts) rows.push(["Episodes (state resets)", String(S.viz!.starts.reduce((a, b) => a + b, 0))]);
   if (m.argmax) {
     const pct = (100 * m.argmax.agree) / m.argmax.total;
     rows.push(["Same choice as log", `${m.argmax.agree} / ${m.argmax.total}`]);
@@ -624,6 +778,34 @@ for (const host of [$("demoList"), $("emptyDemos")]) {
   });
 }
 
+$("fileCompare").addEventListener("change", async (e) => {
+  const input = e.target as HTMLInputElement;
+  const f = input.files?.[0];
+  input.value = "";
+  if (!f) return;
+  try {
+    S.cmp = newCmp(new Uint8Array(await f.arrayBuffer()), f.name);
+    syncCompareUI();
+    if (S.trace) await rebuild(false);
+  } catch (err) {
+    S.cmp = null;
+    syncCompareUI();
+    status(`Second model: ${err instanceof Error ? err.message : err}`, true);
+  }
+});
+$("cmpLayout").addEventListener("change", (e) => {
+  S.cmpLayout = (e.target as HTMLSelectElement).value as CompareLayout;
+  makeRenderer();
+  redraw(0);
+});
+$("cmpOff").addEventListener("click", () => {
+  S.cmp = null;
+  syncCompareUI();
+  makeRenderer();
+  drawRibbon();
+  redraw(0);
+});
+
 $("play").addEventListener("click", () => (S.playing ? stop() : play()));
 $("scrub").addEventListener("input", (e) => {
   stop();
@@ -651,6 +833,7 @@ themeSeg.addEventListener("click", (e) => {
   S.theme = THEMES.find((t) => t.id === b.dataset.theme)!;
   themeSeg.querySelectorAll("button").forEach((x) => x.setAttribute("aria-checked", String(x === b)));
   if (S.renderer) S.renderer.opt.theme = S.theme;
+  renderLegend();
   drawRibbon();
   redraw(0);
 });
@@ -785,6 +968,7 @@ async function doExport() {
   try {
     const t0 = performance.now();
     const res = await runExport({
+      make: makeDrawable,
       viz: S.viz,
       labels: S.labels,
       opt: o,
@@ -799,6 +983,9 @@ async function doExport() {
     });
     if (S.lastUrl) URL.revokeObjectURL(S.lastUrl);
     S.lastUrl = URL.createObjectURL(res.blob);
+    S.lastBlob = res.blob;
+    S.lastExt = res.ext;
+    ($("playerPage") as HTMLButtonElement).disabled = false;
     const name = `${(S.labels.title || "netglow").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}.${res.ext}`;
     const a = document.createElement("a");
     a.href = S.lastUrl;
@@ -806,7 +993,7 @@ async function doExport() {
     a.textContent = `Download ${name}`;
     const p = $("exportResult");
     p.textContent = "";
-    p.append(a, ` · ${res.note}, ${o.width}×${o.height}, ${res.frames} frames, ${(res.blob.size / 1e6).toFixed(1)} MB, ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+    p.append(a, ` · ${res.note}, ${view.width}×${view.height}, ${res.frames} frames, ${(res.blob.size / 1e6).toFixed(1)} MB, ${((performance.now() - t0) / 1000).toFixed(1)} s`);
     (window as unknown as { __lastExport: { url: string; name: string; size: number } }).__lastExport = { url: S.lastUrl, name, size: res.blob.size };
     a.click();
   } catch (e) {
@@ -824,16 +1011,122 @@ $("exportTop").addEventListener("click", doExport);
 $("exportCancel").addEventListener("click", () => S.exportAbort?.abort());
 window.addEventListener("resize", () => drawRibbon());
 
-// live mode (src/live.ts): streamed ticks become a rolling recording + trace, drawn through rebuild()
-const live = initLive({ S, loadModel: async (b, n) => (await loadModelBytes(b, n), applySaved()), rebuild, redraw, stop, status, markFile });
+// ---------- "What am I looking at" ----------
+const LEGEND_KEY = "netglow:legend-seen:v1";
+const embed = new URLSearchParams(location.search).get("embed") === "1";
+function renderLegend() {
+  const V = S.viz;
+  $("legendList").innerHTML = legendHTML(S.theme, S.style.pos || S.theme.pos, S.style.neg || S.theme.neg, {
+    image: !!V?.imageInput, maps: !!V?.cols.some((c) => c.maps) && S.showMaps, skip: !!V?.edges.some((e) => e.kind === "skip"),
+    recurrent: !!V?.edges.some((e) => e.kind === "recurrent"), saliency: !!S.style.saliency && !!S.plan?.saliency && !S.plan.saliency.error, compare: !!S.cmp?.viz,
+  });
+}
+function showLegend(on: boolean) {
+  $("legend").hidden = !on;
+  $("legendBtn").setAttribute("aria-expanded", String(on));
+  if (on) {
+    renderLegend();
+    ($("legendOk") as HTMLButtonElement).focus({ preventScroll: true });
+  } else {
+    try {
+      localStorage.setItem(LEGEND_KEY, "1");
+    } catch {
+      /* private mode: it shows again next time */
+    }
+  }
+}
+$("legendBtn").addEventListener("click", () => showLegend($("legend").hidden));
+$("legendClose").addEventListener("click", () => showLegend(false));
+$("legendOk").addEventListener("click", () => {
+  showLegend(false);
+  $("legendBtn").focus();
+});
+$("legend").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    showLegend(false);
+    $("legendBtn").focus();
+  }
+});
+let legendSeen = false;
+try {
+  legendSeen = localStorage.getItem(LEGEND_KEY) === "1";
+} catch {
+  legendSeen = false;
+}
+
+// ---------- embed ----------
+/** an <iframe> of the hosted app in ?embed=1 mode for a bundled demo; for your own files, a self-contained player page */
+function embedCode(): string {
+  const [w, h] = [view.width, view.height];
+  const title = (S.labels?.title ?? "netglow").replace(/"/g, "&quot;");
+  const dw = Math.min(720, w);
+  const dh = Math.round((dw * h) / w);
+  if (S.demoId) {
+    const src = `${location.origin}${location.pathname}?demo=${encodeURIComponent(S.demoId)}&embed=1${toHash(collectSettings())}`;
+    return `<iframe src="${src}" width="${dw}" height="${dh}" style="border:0;max-width:100%;aspect-ratio:${w}/${h};height:auto" loading="lazy" title="netglow: ${title}"></iframe>`;
+  }
+  return `<iframe src="netglow-player.html" width="${dw}" height="${dh}" style="border:0;max-width:100%;aspect-ratio:${w}/${h};height:auto" loading="lazy" title="netglow: ${title}"></iframe>`;
+}
+function renderEmbed() {
+  if (!S.viz) return;
+  ($("embedCode") as HTMLTextAreaElement).value = embedCode();
+  $("embedNote").textContent = S.demoId
+    ? "Plays this demo with this look on any page (the hosted app in a chrome-less embed mode)."
+    : "Your files stay on your machine, so the embed plays an export: export first (MP4 or WebM stay smallest), then download the player page and host it next to your page.";
+}
+$("copyEmbed").addEventListener("click", async () => {
+  renderEmbed();
+  const code = ($("embedCode") as HTMLTextAreaElement).value;
+  try {
+    await navigator.clipboard.writeText(code);
+    $("embedNote").textContent = "Embed code copied.";
+  } catch {
+    ($("embedCode") as HTMLTextAreaElement).select();
+    $("embedNote").textContent = "Select the code above and copy it.";
+  }
+});
+$("playerPage").addEventListener("click", async () => {
+  if (!S.lastBlob) return;
+  const data = await new Promise<string>((res) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result));
+    r.readAsDataURL(S.lastBlob!);
+  });
+  const title = esc(S.labels?.title ?? "netglow");
+  const media = S.lastExt === "gif" ? `<img src="${data}" alt="${title}">` : `<video src="${data}" autoplay loop muted playsinline aria-label="${title}"></video>`;
+  const html = `<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title>
+<style>html,body{margin:0;height:100%;background:${S.transparent ? "transparent" : S.style.bg || S.theme.bg}}body{display:grid;place-items:center}img,video{max-width:100%;max-height:100vh;display:block}</style></head>
+<body>${media}<script>if(matchMedia("(prefers-reduced-motion: reduce)").matches){const v=document.querySelector("video");if(v){v.pause();v.controls=true}}</script></body></html>\n`;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+  a.download = "netglow-player.html";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+if (embed) {
+  document.body.classList.add("embed");
+  const link = document.createElement("a");
+  link.className = "embed-link";
+  link.href = location.href.replace(/[?&]embed=1/, "");
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.textContent = "netglow ↗";
+  $("well").appendChild(link);
+  // click or Space (the window's key handler) plays and pauses; the canvas takes focus so Space reaches it
+  view.tabIndex = 0;
+  view.addEventListener("click", () => (S.playing ? stop() : play()));
+}
 
 // test / automation hook
-(window as unknown as { netglow: unknown }).netglow = { S, loadDemo, handleFiles, redraw, play, stop, live };
+// live mode (src/live.ts): streamed ticks become a rolling recording + trace, drawn through rebuild()
+const live = initLive({ S, loadModel: async (b, n) => (await loadModelBytes(b, n), applySaved()), rebuild, redraw, stop, status, markFile });
+(window as unknown as { netglow: unknown }).netglow = { S, loadDemo, handleFiles, redraw, play, stop, showLegend, live };
 
 // first open: load the MLP demo so the page shows a live network straight away (?demo=none or ?live=… keeps it empty)
 const q = new URLSearchParams(location.search).get("demo") ?? (new URLSearchParams(location.search).has("live") ? "none" : "lunar-mlp");
 if (q !== "none")
   loadDemo(q).then(() => {
+    if (!embed && !legendSeen && S.viz) showLegend(true);
     if (S.viz && !matchMedia("(prefers-reduced-motion: reduce)").matches && !new URLSearchParams(location.search).has("paused")) play();
   });
 
@@ -870,6 +1163,8 @@ const GROUPS: { title: string; ctls: Ctl[] }[] = [
       { key: "aiScale", label: "AI view size", type: "range", min: 0.3, max: 2, step: 0.05, unit: "×", only: "image" },
       { key: "recPos", label: "Recording", type: "select", options: [["auto", "Next to the AI view"], ...POS], only: "frames" },
       { key: "recScale", label: "Recording size", type: "range", min: 0.3, max: 2, step: 0.05, unit: "×", only: "frames" },
+      { key: "saliency", label: "Saliency heatmap (gradient × input)", type: "check", only: "image" },
+      { key: "saliencyOpacity", label: "Heatmap opacity", type: "range", min: 0.1, max: 1, step: 0.05, unit: "×", only: "image" },
     ],
   },
   {
@@ -995,6 +1290,10 @@ function syncStyleUI() {
 function styleChanged() {
   if (S.renderer) {
     S.renderer.opt.style = S.style;
+    S.renderer.opt.saliency = ensureSaliency();
+    renderLegend();
+    renderEmbed();
+    if (S.renderer instanceof CompareRenderer && S.cmp) S.renderer.b.opt.saliency = cmpSaliency(S.cmp);
     redraw(0);
   }
   saveSoon();

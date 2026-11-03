@@ -27,6 +27,9 @@
       <span id="matchPill" class="pill" hidden></span>
       <span class="grow"></span>
       <span class="local-note">Runs in this tab. Nothing is uploaded.</span>
+      <button id="legendBtn" class="icon-btn" type="button" aria-label="What am I looking at?" aria-controls="legend" aria-expanded="false">
+        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="6.4" fill="none" stroke="currentColor" stroke-width="1.3" /><path d="M6.3 6.2a1.8 1.8 0 1 1 2.6 1.6c-.6.3-.9.7-.9 1.3v.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" /><circle cx="8" cy="11.6" r=".8" fill="currentColor" /></svg>
+      </button>
       <button id="exportTop" class="btn primary" type="button" disabled>Export</button>
     </header>
 
@@ -62,6 +65,26 @@
           <h2>Demos</h2>
           <div class="demo-list" id="demoList"></div>
         </section>
+        <section id="compareSection">
+          <h2>Compare</h2>
+          <div class="file-row" data-kind="compare">
+            <label class="file-btn">
+              <input type="file" accept=".onnx" id="fileCompare" />
+              <span class="file-kind">Second model</span>
+              <span class="file-name" id="nameCompare">.onnx, run on the same recording</span>
+            </label>
+          </div>
+          <div class="field compare-on" hidden>
+            <label for="cmpLayout">Layout</label>
+            <select id="cmpLayout">
+              <option value="auto">Auto (stacked on narrow screens)</option>
+              <option value="side">Side by side</option>
+              <option value="stacked">Stacked</option>
+            </select>
+          </div>
+          <p class="hint" id="cmpNote" aria-live="polite"></p>
+          <button class="btn small compare-on" id="cmpOff" type="button" hidden>Stop comparing</button>
+        </section>
         <section id="labelsSection" hidden>
           <h2>Inputs</h2>
           <ul class="label-list" id="inputLabels"></ul>
@@ -81,6 +104,20 @@
           </div>
           <div class="busy" id="busy" hidden><span id="busyText">Running the model…</span><span class="busy-bar"><span id="busyFill"></span></span></div>
         </div>
+        <section class="legend" id="legend" role="dialog" aria-labelledby="legendTitle" hidden>
+          <div class="legend-head">
+            <h2 id="legendTitle">What am I looking at</h2>
+            <button class="icon-btn small" id="legendClose" type="button" aria-label="Close">
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" /></svg>
+            </button>
+          </div>
+          <p class="legend-lead">A real network, replaying a real recording tick by tick. Left to right: what it reads, its layers, what it decides.</p>
+          <dl class="legend-list" id="legendList"></dl>
+          <div class="legend-foot">
+            <button class="btn small primary" id="legendOk" type="button">Got it</button>
+            <span class="hint">Open it again with <span aria-hidden="true">?</span> in the top bar.</span>
+          </div>
+        </section>
         <div class="timeline" id="timeline">
           <button id="play" class="icon-btn" type="button" aria-label="Play" disabled>
             <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path id="playIcon" d="M4 2.5v11l9-5.5z" fill="currentColor" /></svg>
@@ -227,6 +264,15 @@
             <button id="exportCancel" class="btn" type="button">Cancel</button>
           </div>
           <p id="exportResult" class="export-result" aria-live="polite"></p>
+          <div class="field embed-box">
+            <label for="embedCode">Embed</label>
+            <textarea id="embedCode" name="embed-code" class="embed-snippet" readonly rows="4" spellcheck="false" autocomplete="off" translate="no"></textarea>
+            <div class="btn-row">
+              <button id="copyEmbed" class="btn small" type="button">Copy embed code</button>
+              <button id="playerPage" class="btn small" type="button" disabled>Download player page</button>
+            </div>
+            <p class="hint" id="embedNote" aria-live="polite"></p>
+          </div>
         </section>
       </aside>
     </div>
