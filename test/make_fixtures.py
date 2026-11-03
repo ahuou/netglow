@@ -20,3 +20,11 @@ with torch.no_grad(): lg2 = cnn(torch.from_numpy(img)).numpy()
 torch.onnx.export(cnn, torch.zeros(1, 2, 64, 64, dtype=torch.uint8), f"{out}/cnn.onnx", input_names=["obs"], output_names=["logits"], dynamic_axes={"obs": {0: "batch"}, "logits": {0: "batch"}}, opset_version=17, dynamo=False)
 np.savez_compressed(f"{out}/cnn.npz", obs=img, actions=lg2.argmax(1).astype(np.int64), outputs=lg2, fps=np.float64(20))
 print("ok", lg[:2], lg2[:2])
+
+# unsupported on purpose: a residual (skip) connection, to check the error message
+class Res(nn.Module):
+    def __init__(s):
+        super().__init__(); s.a = nn.Linear(8, 8); s.b = nn.Linear(8, 4)
+    def forward(s, x): return s.b(torch.relu(s.a(x)) + x)
+torch.onnx.export(Res(), torch.zeros(1, 8), f"{out}/residual.onnx", input_names=["obs"], output_names=["logits"], dynamic_axes={"obs": {0: "batch"}}, opset_version=17, dynamo=False)
+np.savez_compressed(f"{out}/residual.npz", obs=obs)

@@ -109,18 +109,18 @@ export class Renderer {
     const fr = this.opt.frames;
     if (this.opt.showFrame && fr) {
       const [fh, fw] = [fr.shape[1], fr.shape[2]];
-      const maxW = W * 0.36;
-      let h = H - 80 * s;
+      const maxW = W * 0.3;
+      let h = Math.min(H - 80 * s, H * 0.62);
       let w = (h * fw) / fh;
       if (w > maxW) {
         w = maxW;
         h = (w * fh) / fw;
       }
       this.frameRect = [28 * s, (H - h) / 2, w, h];
-      left = w + 48 * s;
+      left = w + 40 * s;
     }
-    const labelW = (this.viz.imageInput ? 190 : 230) * s;
-    const outW = 210 * s;
+    const labelW = (this.viz.imageInput ? 170 : 200) * s;
+    const outW = 224 * s;
     const x0 = left + labelW;
     const x1 = W - outW;
     const nc = cols.length;

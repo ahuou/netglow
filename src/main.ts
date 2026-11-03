@@ -34,6 +34,7 @@ const DEMOS = [
 
 const S = {
   model: null as ModelInfo | null,
+  modelError: "",
   modelName: "",
   plan: null as Plan | null,
   rec: null as Map<string, NdArray> | null,
@@ -83,9 +84,17 @@ async function loadModelBytes(bytes: Uint8Array, name: string) {
   S.plan = null;
   S.modelName = name;
   markFile("model", name);
-  const m = parseModel(bytes);
-  S.model = m;
-  S.plan = buildPlan(m); // throws UnsupportedGraph with a clear message
+  S.modelError = "";
+  S.trace = null;
+  S.viz = null;
+  try {
+    const m = parseModel(bytes);
+    S.model = m;
+    S.plan = buildPlan(m); // throws UnsupportedGraph with a clear message
+  } catch (e) {
+    S.modelError = e instanceof Error ? e.message : String(e);
+    throw e;
+  }
   S.modeTouched = false;
 }
 
@@ -162,8 +171,8 @@ async function loadDemo(id: string) {
   const base = `demos/${id}/`;
   try {
     stop();
-    status(`Loading demo ${id}`);
-    busy(true, "Downloading the demo", 0.1);
+    status(`Loading demo ${id}…`);
+    busy(true, "Loading the demo…", 0.1);
     const get = async (p: string) => {
       const r = await fetch(base + p);
       if (!r.ok) throw new Error(`Demo file ${base + p} is missing (${r.status}). Run python/train_demos.py to build the demos.`);
@@ -202,7 +211,8 @@ function fail(e: unknown) {
 // ---------- pipeline ----------
 async function rebuild(rerun: boolean) {
   if (!S.model || !S.plan) {
-    if (S.rec) status("Recording loaded. Now drop the ONNX model.");
+    if (S.modelError) status(S.modelError, true);
+    else if (S.rec) status("Recording loaded. Now drop the ONNX model.");
     return;
   }
   if (!S.rec || !S.obs) {
@@ -218,8 +228,8 @@ async function rebuild(rerun: boolean) {
       S.mode = lf ?? (S.plan.softmaxInGraph ? "categorical" : acts && acts.dtype.startsWith("f") && acts.shape.length > 1 ? "continuous" : nOut > 1 ? "categorical" : "continuous");
       ($("mode") as HTMLSelectElement).value = S.mode;
     }
-    busy(true, "Running the model in this tab", 0);
-    S.trace = await runTrace(S.model, S.plan, S.obs, (f) => busy(true, "Running the model in this tab", f));
+    busy(true, "Running the model in this tab…", 0);
+    S.trace = await runTrace(S.model, S.plan, S.obs, (f) => busy(true, "Running the model in this tab…", f));
     busy(false);
   }
   const prev = S.viz ? { input: S.viz.cols[0].order, output: S.viz.cols[S.viz.cols.length - 1].order } : undefined;
@@ -240,7 +250,7 @@ async function rebuild(rerun: boolean) {
   for (const id of ["play", "scrub", "exportBtn", "exportTop"]) ($(id) as HTMLButtonElement).disabled = false;
   const sc = $("scrub") as HTMLInputElement;
   sc.max = String(S.viz.T - 1);
-  $("frameSection").hidden = !S.rec.get("frames");
+  syncFrameSection();
   drawRibbon();
   redraw(0);
 }
@@ -341,6 +351,10 @@ function stop() {
 }
 
 const frameCanvas = $<HTMLCanvasElement>("framePreview");
+/** the side preview only when the canvas does not already show the recording */
+function syncFrameSection() {
+  $("frameSection").hidden = !S.rec?.get("frames") || S.showFrame;
+}
 function drawFramePreview(k: number) {
   const f = S.rec?.get("frames");
   if (!f || $("frameSection").hidden) return;
@@ -459,6 +473,30 @@ function renderLabelsPanel() {
 }
 
 // ---------- events ----------
+/** Alt + arrow in a name field moves that row: the keyboard version of dragging on the canvas */
+function keyReorder(listId: string, colOf: () => number, attr: "in" | "out") {
+  $(listId).addEventListener("keydown", (e) => {
+    const el = e.target as HTMLInputElement;
+    if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown") || el.dataset[attr] === undefined || !S.viz) return;
+    e.preventDefault();
+    const ci = colOf();
+    const col = S.viz.cols[ci];
+    const unit = Number(el.dataset[attr]);
+    const slot = col.order.findIndex((ii) => col.sel[ii] === unit);
+    const to = slot + (e.key === "ArrowUp" ? -1 : 1);
+    if (to < 0 || to >= col.order.length) return;
+    const [it] = col.order.splice(slot, 1);
+    col.order.splice(to, 0, it);
+    if (ci === S.viz.cols.length - 1) orderHidden(S.viz);
+    renderLabelsPanel();
+    drawRibbon();
+    redraw(0);
+    ($(listId).querySelector(`input[data-${attr}="${unit}"]`) as HTMLInputElement | null)?.focus();
+  });
+}
+keyReorder("inputLabels", () => 0, "in");
+keyReorder("outputLabels", () => S.viz!.cols.length - 1, "out");
+
 $("inputLabels").addEventListener("input", (e) => {
   const el = e.target as HTMLInputElement;
   const u = Number(el.dataset.in);
@@ -591,6 +629,7 @@ $("hz").addEventListener("change", (e) => {
 $("showFrame").addEventListener("change", (e) => {
   S.showFrame = (e.target as HTMLInputElement).checked;
   if (S.renderer) S.renderer.opt.showFrame = S.showFrame;
+  syncFrameSection();
   redraw(0);
 });
 $("transparent").addEventListener("change", (e) => {
@@ -714,5 +753,9 @@ window.addEventListener("resize", () => drawRibbon());
 // test / automation hook
 (window as unknown as { netglow: unknown }).netglow = { S, loadDemo, handleFiles, redraw, play, stop };
 
-const q = new URLSearchParams(location.search).get("demo");
-if (q) loadDemo(q);
+// first open: load the MLP demo so the page shows a live network straight away (?demo=none keeps it empty)
+const q = new URLSearchParams(location.search).get("demo") ?? "lunar-mlp";
+if (q !== "none")
+  loadDemo(q).then(() => {
+    if (S.viz && !matchMedia("(prefers-reduced-motion: reduce)").matches && !new URLSearchParams(location.search).has("paused")) play();
+  });

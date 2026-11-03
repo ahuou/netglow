@@ -4,7 +4,7 @@ const [which, format, outFile, size = "960x540", fps = "30", to = "", extra = ""
 const browser = await chromium.launch({ args: ["--enable-features=WebCodecs"] });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, acceptDownloads: true });
 page.on("pageerror", (e) => console.log("[pageerror]", e.message));
-await page.goto(process.env.URL ?? "http://localhost:5181/");
+await page.goto(process.env.URL ?? "http://localhost:5181/?demo=none");
 if (which.startsWith("demo:")) await page.click(`#demoList [data-demo="${which.slice(5)}"]`);
 else {
   await page.setInputFiles("#fileModel", `test/fixtures/${which}.onnx`);

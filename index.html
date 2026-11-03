@@ -6,6 +6,7 @@
     <title>netglow</title>
     <meta name="description" content="Drop in a neural network and a recording of its inputs; get an animated video of its real activations. Runs entirely in your browser." />
     <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#171719" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
   </head>
   <body>
@@ -19,7 +20,7 @@
           <circle cx="19" cy="6" r="2.2" fill="currentColor" opacity=".55" />
           <circle cx="19" cy="18" r="2.2" fill="var(--accent)" />
         </svg>
-        <span>netglow</span>
+        <span translate="no">netglow</span>
       </a>
       <span class="sep" aria-hidden="true"></span>
       <h1 id="docTitle" class="doc-title">No model loaded</h1>
@@ -66,7 +67,7 @@
           <ul class="label-list" id="inputLabels"></ul>
           <h2 class="mt">Outputs</h2>
           <ul class="label-list" id="outputLabels"></ul>
-          <p class="hint">Drag rows on the canvas to reorder them.</p>
+          <p class="hint">Drag rows on the canvas to reorder them, or press Alt + ↑ / ↓ in a name field.</p>
         </section>
       </aside>
 
@@ -78,7 +79,7 @@
             <p>Drop an ONNX model and a recording of its inputs. netglow runs the model in this tab and animates the real activations, tick by tick.</p>
             <div class="empty-actions" id="emptyDemos"></div>
           </div>
-          <div class="busy" id="busy" hidden><span id="busyText">Running the model</span><span class="busy-bar"><span id="busyFill"></span></span></div>
+          <div class="busy" id="busy" hidden><span id="busyText">Running the model…</span><span class="busy-bar"><span id="busyFill"></span></span></div>
         </div>
         <div class="timeline" id="timeline">
           <button id="play" class="icon-btn" type="button" aria-label="Play" disabled>
@@ -100,7 +101,7 @@
         <section>
           <h2>Match check</h2>
           <dl class="kv" id="matchKv">
-            <div><dt>Status</dt><dd id="matchText">Load a model and a recording</dd></div>
+            <div><dt>Status</dt><dd id="matchText" class="text">Nothing loaded</dd></div>
           </dl>
         </section>
         <section>
@@ -115,7 +116,7 @@
           </div>
           <fieldset class="field">
             <legend>Theme</legend>
-            <div class="seg" id="themeSeg" role="radiogroup"></div>
+            <div class="seg" id="themeSeg" role="radiogroup" aria-label="Theme"></div>
           </fieldset>
           <div class="field two">
             <div>
@@ -140,10 +141,11 @@
               <label for="hz">Decision rate</label>
               <div class="unit-input"><input id="hz" type="number" min="0.1" step="any" value="30" inputmode="decimal" /><span>Hz</span></div>
             </div>
-            <div class="check-col">
-              <label class="check"><input id="showFrame" type="checkbox" /> <span>Show recording</span></label>
-              <label class="check"><input id="transparent" type="checkbox" /> <span>Transparent</span></label>
-            </div>
+            <div></div>
+          </div>
+          <div class="field checks">
+            <label class="check"><input id="showFrame" type="checkbox" /> <span>Recording on canvas</span></label>
+            <label class="check"><input id="transparent" type="checkbox" /> <span>Transparent background</span></label>
           </div>
         </section>
         <section>

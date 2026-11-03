@@ -1,7 +1,7 @@
 // Headless smoke test: load fixtures or a demo, check the match, screenshot. usage: node test/smoke.mjs [mlp|cnn|demo:<id>] [url]
 import { chromium } from "@playwright/test";
 const which = process.argv[2] ?? "mlp";
-const url = process.argv[3] ?? "http://localhost:5181/";
+const url = process.argv[3] ?? "http://localhost:5181/?demo=none";
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, acceptDownloads: true });
 const logs = [];
@@ -21,5 +21,7 @@ await page.evaluate(() => { const n = window.netglow; n.S.t = (n.S.viz.T * 0.4) 
 await page.waitForTimeout(300);
 const name = which.replace(":", "-");
 await page.screenshot({ path: `test/shots/${name}.png` });
+const png = await page.evaluate(() => document.getElementById("view").toDataURL("image/png"));
+(await import("node:fs")).writeFileSync(`test/shots/${name}-canvas.png`, Buffer.from(png.split(",")[1], "base64"));
 console.log(logs.filter((l) => !l.includes("[vite]")).join("\n"));
 await browser.close();
